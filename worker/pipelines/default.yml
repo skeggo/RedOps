@@ -1,0 +1,29 @@
+stage: default
+tools:
+  - name: direct_target
+    enabled: true
+
+  - name: subfinder
+    enabled: true
+    timeout: 120
+
+  - name: httpx
+    enabled: true
+    timeout: 180
+
+  - name: nikto
+    enabled: true
+    timeout: 150
+    args:
+      maxtime: "2m"
+      per_request_timeout: 5
+
+  - name: nuclei
+    enabled: false
+    timeout: 60
+    args:
+      templates: "http/exposures/"
+      rate_limit: 10
+      timeout: 5
+      retries: 1
+      concurrency: 10

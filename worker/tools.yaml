@@ -1,0 +1,30 @@
+tools:
+  - name: subfinder
+    type: github_zip
+    repo: projectdiscovery/subfinder
+    asset_regex: "linux_amd64\\.zip$"
+    bin_name: subfinder
+
+  - name: httpx
+    type: github_zip
+    repo: projectdiscovery/httpx
+    asset_regex: "linux_amd64\\.zip$"
+    bin_name: httpx
+
+  - name: nuclei
+    type: github_zip
+    repo: projectdiscovery/nuclei
+    asset_regex: "linux_amd64\\.zip$"
+    bin_name: nuclei
+
+  - name: ffuf
+    type: github_targz
+    repo: ffuf/ffuf
+    asset_regex: "linux_amd64\\.tar\\.gz$"
+    bin_name: ffuf
+
+  - name: nikto
+    type: git
+    repo_url: "https://github.com/sullo/nikto.git"
+    link: "/opt/nikto/program/nikto.pl"
+    target: "/usr/local/bin/nikto"
