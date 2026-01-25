@@ -21,6 +21,11 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build docker images
+        env:
+          # docker-compose.yml requires these variables for interpolation.
+          # Safe dummy values are fine for CI builds (containers are not run).
+          API_KEYS: local=changeme
+          SCAN_ALLOWLIST: ci.example
         run: |
           docker compose build --progress=plain
 
