@@ -11,12 +11,13 @@ WORKDIR /app
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY requirements.txt /app/requirements.txt
+COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY install-tools.sh /usr/local/bin/install-tools
-COPY tools.yaml /app/tools.yaml
+COPY worker/install-tools.sh /usr/local/bin/install-tools
+COPY worker/tools.yaml /app/tools.yaml
 RUN chmod +x /usr/local/bin/install-tools && /usr/local/bin/install-tools /app/tools.yaml
 
-COPY . /app
+COPY worker/ /app/
+COPY common/ /app/common/
 CMD ["python3", "worker.py"]

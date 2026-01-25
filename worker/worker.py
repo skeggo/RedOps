@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 import yaml
 
 from tools.plugin import load_tool
+from scope_controls import ScopeError, load_allowlist, validate_target
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, future=True)
@@ -28,12 +29,20 @@ def init_db():
         CREATE TABLE IF NOT EXISTS scans (
           id TEXT PRIMARY KEY,
           target TEXT NOT NULL,
+          api_key_id TEXT NOT NULL DEFAULT 'unknown',
+          triggered_by TEXT NOT NULL DEFAULT 'unknown',
+          concurrency_cap INT NULL,
           status TEXT NOT NULL,
           created_at TIMESTAMP NOT NULL
         );
         """))
+
+        # Add new columns to existing installs (best-effort in-app migration).
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NOT NULL DEFAULT 'unknown'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'unknown'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
         conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS findings (
+          CREATE TABLE IF NOT EXISTS findings (
           id SERIAL PRIMARY KEY,
           scan_id TEXT NOT NULL,
           tool TEXT NOT NULL,
@@ -43,9 +52,7 @@ def init_db():
         """))
 
         # Best-effort in-app migration from the legacy MVP schema (tool_runs without `id`).
-        conn.execute(
-            text(
-            """
+        conn.execute(text("""
             DO $$
             BEGIN
                 IF EXISTS (
@@ -315,7 +322,15 @@ def set_status(scan_id: str, status: str):
 def get_next_scan():
     with engine.begin() as conn:
         row = conn.execute(
-            text("SELECT id, target FROM scans WHERE status='queued' ORDER BY created_at ASC LIMIT 1")
+            text(
+                """
+                SELECT id, target, api_key_id, triggered_by, concurrency_cap
+                FROM scans
+                WHERE status='queued'
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            )
         ).mappings().first()
     return row
 
@@ -356,6 +371,14 @@ def run_pipeline(scan_id: str, target: str, mode: str):
     pipeline = load_pipeline_config(PIPELINE)
     tools = pipeline.get("tools") or []
 
+    # Per-scan concurrency cap: used to clamp tool-level concurrency flags.
+    # (Worker processes one scan at a time, so this mainly limits tool internals.)
+    scan_concurrency_cap = os.getenv("SCAN_CONCURRENCY_CAP")
+    try:
+        scan_concurrency_cap_int = int(scan_concurrency_cap) if scan_concurrency_cap not in (None, "") else None
+    except Exception:
+        scan_concurrency_cap_int = None
+
     ctx: dict = {
         "scan_id": scan_id,
         "target": target,
@@ -363,6 +386,7 @@ def run_pipeline(scan_id: str, target: str, mode: str):
         "fast_mode": FAST_MODE,
         "subdomains": [],
         "urls": [],
+        "concurrency_cap": scan_concurrency_cap_int,
         # Inject helpers for plugins
         "run": run,
         "log": log,
@@ -378,6 +402,16 @@ def run_pipeline(scan_id: str, target: str, mode: str):
 
         timeout = int(spec.get("timeout", 600))
         args = spec.get("args") or {}
+
+        # Clamp common concurrency knobs as a basic per-scan rate limit.
+        cap = ctx.get("concurrency_cap")
+        if cap is not None:
+            for key in ("concurrency", "threads", "workers"):
+                if key in args:
+                    try:
+                        args[key] = min(int(args[key]), int(cap))
+                    except Exception:
+                        pass
 
         enabled = bool(spec.get("enabled", True))
 
@@ -544,8 +578,26 @@ def main():
         scan_id = job["id"]
         raw_target = job["target"]
 
+        # Per-scan cap from DB overrides env default.
+        if job.get("concurrency_cap") is not None:
+            os.environ["SCAN_CONCURRENCY_CAP"] = str(job.get("concurrency_cap"))
+
+        log(
+            f"picked scan {scan_id} target={raw_target} api_key_id={job.get('api_key_id')} triggered_by={job.get('triggered_by')}"
+        )
+
+        # Defense-in-depth: validate scope again in the worker.
+        lab_mode = os.getenv("LAB_MODE", "0") == "1"
+        try:
+            allowlist = load_allowlist()
+            validate_target(str(raw_target), allowlist=allowlist, lab_mode=lab_mode)
+        except ScopeError as e:
+            insert_finding(scan_id, "scope_rejected", {"error": str(e), "target": raw_target, "lab_mode": lab_mode})
+            set_status(scan_id, "failed")
+            log(f"scan {scan_id} rejected by scope gate: {e}")
+            continue
+
         set_status(scan_id, "running")
-        log(f"picked scan {scan_id} target={raw_target}")
 
         target, is_url_mode = normalize_target(raw_target)
         log(f"normalized target={target} url_mode={is_url_mode}")

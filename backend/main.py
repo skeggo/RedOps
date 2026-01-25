@@ -1,8 +1,11 @@
 import os
 import uuid
 from datetime import datetime
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import create_engine, text
+
+from auth import authenticate_request
+from scope_controls import ScopeError, load_allowlist, validate_target
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, future=True)
@@ -17,10 +20,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS scans (
           id TEXT PRIMARY KEY,
           target TEXT NOT NULL,
+          api_key_id TEXT NOT NULL DEFAULT 'unknown',
+          triggered_by TEXT NOT NULL DEFAULT 'unknown',
+          concurrency_cap INT NULL,
           status TEXT NOT NULL,
           created_at TIMESTAMP NOT NULL
         );
         """))
+
+        # Add new columns to existing installs (best-effort in-app migration).
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NOT NULL DEFAULT 'unknown'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'unknown'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS findings (
           id SERIAL PRIMARY KEY,
@@ -31,7 +42,7 @@ def init_db():
         );
         """))
 
-                # Best-effort in-app migration from the legacy MVP schema (tool_runs without `id`).
+        # Best-effort in-app migration from the legacy MVP schema (tool_runs without `id`).
         conn.execute(text("""
             DO $$
             BEGIN
@@ -89,18 +100,61 @@ def init_db():
         """))
 
 @app.post("/scan")
-def create_scan(body: dict):
+def create_scan(body: dict, request: Request):
+    api_key_id, _secret = authenticate_request(request)
+
     target = body.get("target")
     if not target:
-        return {"error": "Missing target"}
+        raise HTTPException(status_code=400, detail="Missing target")
+
+    triggered_by = (
+        request.headers.get("X-Triggered-By")
+        or body.get("triggered_by")
+        or os.getenv("TRIGGERED_BY", "local")
+    )
+
+    concurrency_cap = body.get("concurrency_cap")
+    if concurrency_cap is None:
+        concurrency_cap = os.getenv("SCAN_CONCURRENCY_CAP")
+    try:
+        concurrency_cap = int(concurrency_cap) if concurrency_cap not in (None, "") else None
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid concurrency_cap")
+
+    lab_mode = os.getenv("LAB_MODE", "0") == "1"
+    try:
+        allowlist = load_allowlist()
+        validation = validate_target(str(target), allowlist=allowlist, lab_mode=lab_mode)
+    except ScopeError as e:
+        raise HTTPException(status_code=400, detail=f"Scope rejected: {e}")
 
     scan_id = str(uuid.uuid4())
     with engine.begin() as conn:
         conn.execute(
-            text("INSERT INTO scans (id, target, status, created_at) VALUES (:id,:t,:s,:c)"),
-            {"id": scan_id, "t": target, "s": "queued", "c": datetime.utcnow()},
+            text(
+                """
+                INSERT INTO scans (id, target, api_key_id, triggered_by, concurrency_cap, status, created_at)
+                VALUES (:id,:t,:kid,:by,:cap,:s,:c)
+                """
+            ),
+            {
+                "id": scan_id,
+                "t": str(target),
+                "kid": str(api_key_id),
+                "by": str(triggered_by),
+                "cap": concurrency_cap,
+                "s": "queued",
+                "c": datetime.utcnow(),
+            },
         )
-    return {"scan_id": scan_id, "status": "queued"}
+    return {
+        "scan_id": scan_id,
+        "status": "queued",
+        "api_key_id": str(api_key_id),
+        "triggered_by": str(triggered_by),
+        "concurrency_cap": concurrency_cap,
+        "scope": validation,
+    }
 
 @app.get("/scan/{scan_id}")
 def get_scan(scan_id: str):

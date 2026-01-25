@@ -26,7 +26,11 @@ jobs:
 
       - name: Python compile check (worker & backend)
         run: |
-          python3 -m py_compile worker/worker.py worker/tools/*.py backend/main.py || true
+          python3 -m py_compile common/*.py worker/*.py worker/tools/*.py backend/*.py || true
+
+      - name: Unit tests (scope controls)
+        run: |
+          python3 -m unittest discover -s backend/tests -p 'test_*.py'
 
       - name: Lint (optional)
         run: |

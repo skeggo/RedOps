@@ -16,9 +16,17 @@ services:
       retries: 30
 
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-rt}:${POSTGRES_PASSWORD:-rt}@db:5432/${POSTGRES_DB:-rt}}
+      # API auth
+      API_KEYS: ${API_KEYS:?Set API_KEYS (e.g., 'local=changeme')}
+      # Scope control / safety gates
+      SCAN_ALLOWLIST: ${SCAN_ALLOWLIST:?Set SCAN_ALLOWLIST (e.g., 'juiceshop,example.com')}
+      LAB_MODE: ${LAB_MODE:-0}
+      SCAN_CONCURRENCY_CAP: ${SCAN_CONCURRENCY_CAP:-10}
     ports:
       - "8000:8000"
     depends_on:
@@ -26,9 +34,15 @@ services:
         condition: service_healthy
 
   worker:
-    build: ./worker
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-rt}:${POSTGRES_PASSWORD:-rt}@db:5432/${POSTGRES_DB:-rt}}
+      # Scope control / safety gates
+      SCAN_ALLOWLIST: ${SCAN_ALLOWLIST:?Set SCAN_ALLOWLIST (e.g., 'juiceshop,example.com')}
+      LAB_MODE: ${LAB_MODE:-0}
+      SCAN_CONCURRENCY_CAP: ${SCAN_CONCURRENCY_CAP:-10}
     depends_on:
       db:
         condition: service_healthy
