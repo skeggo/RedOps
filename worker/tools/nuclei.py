@@ -50,8 +50,9 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
             str(targets_path),
             "-jsonl",
             "-silent",
+            "-duc",
             "-t",
-            str(args.get("templates", "http/exposures/")),
+            str(args.get("templates", "/opt/nuclei-templates/http/exposures/")),
             "-rate-limit",
             str(args.get("rate_limit", 10)),
             "-timeout",
@@ -62,7 +63,7 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
             str(args.get("concurrency", 10)),
         ]
     else:
-        cmd = ["nuclei", "-l", str(targets_path), "-jsonl", "-silent"]
+        cmd = ["nuclei", "-l", str(targets_path), "-jsonl", "-silent", "-duc"]
 
     nuclei_json = runner(cmd, timeout=timeout)
 

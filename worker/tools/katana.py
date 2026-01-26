@@ -73,4 +73,14 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
             pass
 
     ctx["katana_urls"] = urls
-    return {"count": len(urls), "max_urls": cap}
+
+    # Include a capped list of URLs in the returned payload so reports can render
+    # discovered endpoints without needing to read artifact files.
+    report_limit = int(args.get("report_limit", 100))
+    urls_for_report = urls[: max(0, report_limit)]
+    return {
+        "count": len(urls),
+        "max_urls": cap,
+        "urls": urls_for_report,
+        "urls_truncated": len(urls_for_report) < len(urls),
+    }

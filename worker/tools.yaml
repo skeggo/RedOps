@@ -27,6 +27,10 @@ tools:
     asset_regex: "{arch}\\.zip$"
     bin_name: nuclei
 
+  - name: nuclei-templates
+    type: git
+    repo_url: "https://github.com/projectdiscovery/nuclei-templates.git"
+
   - name: ffuf
     type: github_targz
     repo: ffuf/ffuf

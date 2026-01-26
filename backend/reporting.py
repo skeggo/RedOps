@@ -30,6 +30,180 @@ def _classify_finding_tool(tool: str) -> str:
     return "result"
 
 
+def _extract_httpx_live_targets(findings_list: list[dict[str, Any]], *, limit: int = 50) -> list[str]:
+    """Best-effort extraction of live URLs from the httpx tool's summary finding.
+
+    We intentionally derive from DB-stored findings payloads rather than reading artifact files,
+    so the backend stays stateless and doesn't need access to worker container paths.
+    """
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    for f in findings_list:
+        if str(f.get("tool") or "") != "httpx":
+            continue
+        payload = f.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        # Preferred: worker httpx wrapper stores parsed jsonl lines as payload['results'].
+        results = payload.get("results")
+        if isinstance(results, list):
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                u = str(r.get("url") or "").strip()
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                urls.append(u)
+                if len(urls) >= limit:
+                    return urls
+
+        # Fallback: some implementations might store 'live_urls' or 'urls'.
+        for key in ("live_urls", "urls"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                for u0 in val:
+                    u = str(u0 or "").strip()
+                    if not u or u in seen:
+                        continue
+                    seen.add(u)
+                    urls.append(u)
+                    if len(urls) >= limit:
+                        return urls
+
+    return urls
+
+
+def _extract_katana_endpoints(
+    findings_list: list[dict[str, Any]],
+    *,
+    limit: int = 100,
+) -> tuple[list[str], int | None, bool | None]:
+    """Return (endpoints, total_count, truncated).
+
+    Uses the latest katana summary finding payload.
+    """
+
+    # Prefer the latest katana run (findings are ordered by insertion time).
+    for f in reversed(findings_list):
+        if str(f.get("tool") or "") != "katana":
+            continue
+        payload = f.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        raw_urls = payload.get("urls")
+        if not isinstance(raw_urls, list):
+            raw_urls = payload.get("katana_urls")
+
+        urls: list[str] = []
+        seen: set[str] = set()
+        if isinstance(raw_urls, list):
+            for u0 in raw_urls:
+                u = str(u0 or "").strip()
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                urls.append(u)
+                if len(urls) >= limit:
+                    break
+
+        total_count = None
+        try:
+            total_count = int(payload.get("count")) if payload.get("count") is not None else None
+        except Exception:
+            total_count = None
+
+        truncated = payload.get("urls_truncated")
+        if not isinstance(truncated, bool):
+            truncated = None
+
+        return urls, total_count, truncated
+
+    return [], None, None
+
+
+def _severity_rank(sev: str) -> int:
+    s = (sev or "").strip().lower()
+    order = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+        "info": 4,
+        "informational": 4,
+        "unknown": 5,
+        "": 5,
+    }
+    return order.get(s, 5)
+
+
+def _extract_nuclei_vulnerabilities(
+    findings_list: list[dict[str, Any]],
+    *,
+    limit: int = 50,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Return (vulns, counts_by_severity).
+
+    Only includes nuclei *result* findings (not summary/error markers).
+    """
+
+    vulns: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    counts: Counter[str] = Counter()
+
+    for f in findings_list:
+        if str(f.get("tool") or "") != "nuclei":
+            continue
+        payload = f.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        template_id = str(payload.get("template_id") or payload.get("template-id") or "").strip()
+        matched_at = str(payload.get("matched_at") or payload.get("matched-at") or payload.get("host") or "").strip()
+        title = str(payload.get("title") or payload.get("name") or "nuclei finding").strip()
+        severity = str(payload.get("severity") or "unknown").strip().lower()
+
+        # Skip the nuclei *summary* finding which doesn't include per-vuln fields.
+        if not template_id and not matched_at:
+            continue
+
+        key = (template_id or title, matched_at)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        counts[severity] += 1
+        vulns.append(
+            {
+                "severity": severity,
+                "title": title,
+                "template_id": template_id or None,
+                "matched_at": matched_at or None,
+                "tool_run_id": payload.get("tool_run_id"),
+            }
+        )
+
+    vulns_sorted = sorted(vulns, key=lambda v: (_severity_rank(str(v.get("severity") or "")), str(v.get("title") or ""), str(v.get("matched_at") or "")))
+    if limit >= 0:
+        vulns_sorted = vulns_sorted[:limit]
+
+    # Return counts in stable order.
+    counts_by_sev: dict[str, int] = {}
+    for sev in ["critical", "high", "medium", "low", "info", "unknown"]:
+        if counts.get(sev):
+            counts_by_sev[sev] = int(counts[sev])
+    # Include any other severities just in case.
+    for sev, n in sorted(counts.items()):
+        if sev not in counts_by_sev:
+            counts_by_sev[sev] = int(n)
+
+    return vulns_sorted, counts_by_sev
+
+
 def compute_scan_summary(
     *,
     scan: Mapping[str, Any],
@@ -150,6 +324,54 @@ def render_scan_report_md(
     lines.append(f"- **Last finished**: `{_iso(tl.get('last_finished_at'))}`")
     lines.append(f"- **Duration (ms)**: `{tl.get('duration_ms')}`")
 
+    live_targets = _extract_httpx_live_targets(findings_list, limit=50)
+    lines.append("")
+    lines.append("## Live Targets")
+    lines.append("")
+    if not live_targets:
+        lines.append("_No live targets recorded (httpx not run or produced no results)._")
+    else:
+        lines.append(f"- **Count**: `{len(live_targets)}`")
+        lines.append("")
+        for u in live_targets:
+            lines.append(f"- `{u}`")
+
+    endpoints, endpoints_total, endpoints_truncated = _extract_katana_endpoints(findings_list, limit=100)
+    lines.append("")
+    lines.append("## Discovered Endpoints")
+    lines.append("")
+    if not endpoints:
+        lines.append("_No endpoints recorded (katana not run or produced no URLs)._")
+    else:
+        shown = len(endpoints)
+        if endpoints_total is not None:
+            lines.append(f"- **Total discovered**: `{endpoints_total}`")
+        lines.append(f"- **Shown**: `{shown}`")
+        if endpoints_truncated is True:
+            lines.append("- _Note: endpoint list is truncated for report size._")
+        lines.append("")
+        for u in endpoints:
+            lines.append(f"- `{u}`")
+
+    vulns, vulns_by_sev = _extract_nuclei_vulnerabilities(findings_list, limit=50)
+    lines.append("")
+    lines.append("## Vulnerabilities")
+    lines.append("")
+    if not vulns:
+        lines.append("_No nuclei vulnerabilities recorded._")
+    else:
+        lines.append(f"- **Total**: `{sum(vulns_by_sev.values())}`")
+        lines.append(f"- **By severity**: `{dict(vulns_by_sev)}`")
+        lines.append("")
+        lines.append("| Severity | Title | Matched At | Template |")
+        lines.append("|---|---|---|---|")
+        for v in vulns:
+            sev = str(v.get("severity") or "unknown")
+            title = str(v.get("title") or "")
+            matched_at = str(v.get("matched_at") or "")
+            template_id = str(v.get("template_id") or "")
+            lines.append(f"| {sev} | {title} | {matched_at} | {template_id} |")
+
     lines.append("")
     lines.append("## Tool Runs")
     lines.append("")
@@ -174,6 +396,35 @@ def render_scan_report_md(
                     _fmt(r.get("exit_code")),
                     _fmt(r.get("short_error")),
                     _fmt(r.get("artifact_path")),
+                ]
+            )
+            + " |"
+        )
+
+    lines.append("")
+    lines.append("## Artifacts")
+    lines.append("")
+    lines.append("| Tool | Attempt | Status | Artifact Path | Stdout | Stderr |")
+    lines.append("|---|---:|---:|---|---|---|")
+
+    for r in sorted(
+        tool_runs_list,
+        key=lambda rr: (
+            rr.get("queued_at") or datetime.min,
+            rr.get("tool") or "",
+            int(rr.get("attempt") or 0),
+        ),
+    ):
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _fmt(r.get("tool")),
+                    _fmt(r.get("attempt")),
+                    _fmt(r.get("status")),
+                    _fmt(r.get("artifact_path")),
+                    _fmt(r.get("stdout_path")),
+                    _fmt(r.get("stderr_path")),
                 ]
             )
             + " |"

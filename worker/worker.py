@@ -256,6 +256,8 @@ class ToolRunRecorder:
         self.exit_code = None
         if stderr:
             self.stderr_tail = _tail(stderr, 2000)
+            # Persist stderr so timeouts still leave useful diagnostics on disk.
+            self.append(None, stderr)
 
 
 def create_tool_run(
@@ -612,7 +614,7 @@ def run_pipeline(scan_id: str, target: str, mode: str):
 
         except subprocess.TimeoutExpired as e:
             finished_at = _utcnow()
-            short_error = _tail(str(e), 200)
+            short_error = _tail(recorder.stderr_tail or str(e), 200)
             update_tool_run(
                 run_id=run_id,
                 status="timeout",
@@ -625,12 +627,20 @@ def run_pipeline(scan_id: str, target: str, mode: str):
             insert_finding(
                 scan_id,
                 f"{name}_timeout",
-                {"error": str(e), "tool_run_id": run_id, "attempt": attempt},
+                {
+                    "error": str(e),
+                    "stderr_tail": recorder.stderr_tail,
+                    "tool_run_id": run_id,
+                    "attempt": attempt,
+                    "stdout_path": stdout_path,
+                    "stderr_path": stderr_path,
+                    "artifact_path": artifact_path,
+                },
             )
 
         except Exception as e:
             finished_at = _utcnow()
-            short_error = _tail(str(e), 200)
+            short_error = _tail(recorder.stderr_tail or str(e), 200)
             update_tool_run(
                 run_id=run_id,
                 status="failed",
@@ -643,7 +653,15 @@ def run_pipeline(scan_id: str, target: str, mode: str):
             insert_finding(
                 scan_id,
                 f"{name}_error",
-                {"error": str(e), "tool_run_id": run_id, "attempt": attempt},
+                {
+                    "error": str(e),
+                    "stderr_tail": recorder.stderr_tail,
+                    "tool_run_id": run_id,
+                    "attempt": attempt,
+                    "stdout_path": stdout_path,
+                    "stderr_path": stderr_path,
+                    "artifact_path": artifact_path,
+                },
             )
         finally:
             # Restore default helper for safety in the next iteration.
