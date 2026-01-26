@@ -2,15 +2,44 @@ import os
 import uuid
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import create_engine, text
 
 from auth import authenticate_request
 from scope_controls import ScopeError, load_allowlist, validate_target
+from reporting import compute_scan_summary, render_scan_report_md
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, future=True)
 
 app = FastAPI(title="AI Red Team Operator (MVP)")
+
+
+def _get_scan_bundle(scan_id: str) -> tuple[dict, list[dict], list[dict]]:
+    with engine.begin() as conn:
+        scan = conn.execute(text("SELECT * FROM scans WHERE id=:id"), {"id": scan_id}).mappings().first()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        findings = conn.execute(
+            text("SELECT tool, payload, created_at FROM findings WHERE scan_id=:id ORDER BY id ASC"),
+            {"id": scan_id},
+        ).mappings().all()
+
+        tool_runs = conn.execute(
+            text(
+                """
+                SELECT id, tool, status, attempt, queued_at, started_at, finished_at, duration_ms, exit_code,
+                       stdout_path, stderr_path, artifact_path, args, short_error, metadata
+                FROM tool_runs
+                WHERE scan_id=:id
+                ORDER BY queued_at ASC, tool ASC, attempt ASC
+                """
+            ),
+            {"id": scan_id},
+        ).mappings().all()
+
+    return dict(scan), [dict(r) for r in tool_runs], [dict(f) for f in findings]
 
 # Create tables on startup (simple MVP)
 @app.on_event("startup")
@@ -20,10 +49,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS scans (
           id TEXT PRIMARY KEY,
           target TEXT NOT NULL,
-          api_key_id TEXT NULL,
+          api_key_id TEXT NOT NULL DEFAULT 'unknown',
           triggered_by TEXT NOT NULL DEFAULT 'local',
-          triggered_via TEXT NOT NULL DEFAULT 'api',
-          request_ip INET NULL,
           concurrency_cap INT NULL,
           status TEXT NOT NULL,
           created_at TIMESTAMP NOT NULL
@@ -31,42 +58,10 @@ def init_db():
         """))
 
         # Add new columns to existing installs (best-effort in-app migration).
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NULL"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NOT NULL DEFAULT 'unknown'"))
         conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'local'"))
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_via TEXT NOT NULL DEFAULT 'api'"))
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS request_ip INET NULL"))
-
-        # Align legacy defaults.
         conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_by SET DEFAULT 'local'"))
-        conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_via SET DEFAULT 'api'"))
         conn.execute(text("UPDATE scans SET triggered_by='local' WHERE triggered_by='unknown'"))
-
-        # api_key_id used to be NOT NULL DEFAULT 'unknown' (older installs). Make it nullable.
-        conn.execute(
-            text(
-                """
-                DO $$
-                BEGIN
-                    ALTER TABLE scans ALTER COLUMN api_key_id DROP NOT NULL;
-                EXCEPTION WHEN others THEN
-                    NULL;
-                END $$;
-                """
-            )
-        )
-        conn.execute(
-            text(
-                """
-                DO $$
-                BEGIN
-                    ALTER TABLE scans ALTER COLUMN api_key_id DROP DEFAULT;
-                EXCEPTION WHEN others THEN
-                    NULL;
-                END $$;
-                """
-            )
-        )
-        conn.execute(text("UPDATE scans SET api_key_id=NULL WHERE api_key_id='unknown'"))
         conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS findings (
@@ -144,26 +139,15 @@ def create_scan(body: dict, request: Request):
         raise HTTPException(status_code=400, detail="Missing target")
 
     # Who launched the scan:
-    # - Prefer X-Actor
-    # - Fallback to DEFAULT_TRIGGERED_BY
-    default_triggered_by = os.getenv("DEFAULT_TRIGGERED_BY", "local")
+    # - default: 'local'
+    # - optionally accept a username from X-Username
+    # - keep X-Triggered-By/body/env for compatibility
     triggered_by = (
-        request.headers.get("X-Actor")
-        or request.headers.get("X-Username")
+        request.headers.get("X-Username")
         or request.headers.get("X-Triggered-By")
         or body.get("triggered_by")
-        or default_triggered_by
+        or os.getenv("TRIGGERED_BY", "local")
     )
-
-    triggered_via = (
-        request.headers.get("X-Triggered-Via")
-        or body.get("triggered_via")
-        or os.getenv("DEFAULT_TRIGGERED_VIA", "api")
-    )
-
-    request_ip = None
-    if request.client and request.client.host:
-        request_ip = request.client.host
 
     concurrency_cap = body.get("concurrency_cap")
     if concurrency_cap is None:
@@ -185,17 +169,15 @@ def create_scan(body: dict, request: Request):
         conn.execute(
             text(
                 """
-                INSERT INTO scans (id, target, api_key_id, triggered_by, triggered_via, request_ip, concurrency_cap, status, created_at)
-                VALUES (:id,:t,:kid,:by,:via,:ip,:cap,:s,:c)
+                INSERT INTO scans (id, target, api_key_id, triggered_by, concurrency_cap, status, created_at)
+                VALUES (:id,:t,:kid,:by,:cap,:s,:c)
                 """
             ),
             {
                 "id": scan_id,
                 "t": str(target),
-                "kid": str(api_key_id) if api_key_id is not None else None,
+                "kid": str(api_key_id),
                 "by": str(triggered_by),
-                "via": str(triggered_via),
-                "ip": request_ip,
                 "cap": concurrency_cap,
                 "s": "queued",
                 "c": datetime.utcnow(),
@@ -206,34 +188,63 @@ def create_scan(body: dict, request: Request):
         "status": "queued",
         "api_key_id": str(api_key_id),
         "triggered_by": str(triggered_by),
-        "triggered_via": str(triggered_via),
-        "request_ip": request_ip,
         "concurrency_cap": concurrency_cap,
         "scope": validation,
     }
 
 @app.get("/scan/{scan_id}")
 def get_scan(scan_id: str):
-    with engine.begin() as conn:
-        scan = conn.execute(text("SELECT * FROM scans WHERE id=:id"), {"id": scan_id}).mappings().first()
-        if not scan:
+    # Legacy endpoint kept for compatibility.
+    # NOTE: Historically returned {"error":"Not found"} instead of 404.
+    try:
+        scan, tool_runs, findings = _get_scan_bundle(scan_id)
+    except HTTPException as e:
+        if e.status_code == 404:
             return {"error": "Not found"}
-        findings = conn.execute(
-            text("SELECT tool, payload, created_at FROM findings WHERE scan_id=:id ORDER BY id ASC"),
-            {"id": scan_id},
-        ).mappings().all()
+        raise
+    return {"scan": scan, "tool_runs": tool_runs, "findings": findings}
 
-        tool_runs = conn.execute(
+
+@app.get("/scans")
+def list_scans(limit: int = 50, offset: int = 0, status: str | None = None):
+    """List scans (newest first) so you can retrieve old scan IDs for reports."""
+
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+
+    where = ""
+    params: dict = {"limit": int(limit), "offset": int(offset)}
+    if status:
+        where = "WHERE status = :status"
+        params["status"] = str(status)
+
+    with engine.begin() as conn:
+        rows = conn.execute(
             text(
-                """
-                SELECT id, tool, status, attempt, queued_at, started_at, finished_at, duration_ms, exit_code,
-                       stdout_path, stderr_path, artifact_path, args, short_error, metadata
-                FROM tool_runs
-                WHERE scan_id=:id
-                ORDER BY queued_at ASC, tool ASC, attempt ASC
+                f"""
+                SELECT id, target, api_key_id, triggered_by, concurrency_cap, status, created_at
+                FROM scans
+                {where}
+                ORDER BY created_at DESC
+                LIMIT :limit OFFSET :offset
                 """
             ),
-            {"id": scan_id},
+            params,
         ).mappings().all()
 
-    return {"scan": dict(scan), "tool_runs": [dict(r) for r in tool_runs], "findings": [dict(f) for f in findings]}
+    return {"scans": [dict(r) for r in rows], "limit": int(limit), "offset": int(offset), "status": status}
+
+
+@app.get("/scans/{scan_id}/summary")
+def get_scan_summary(scan_id: str):
+    scan, tool_runs, findings = _get_scan_bundle(scan_id)
+    return compute_scan_summary(scan=scan, tool_runs=tool_runs, findings=findings)
+
+
+@app.get("/scans/{scan_id}/report.md")
+def get_scan_report_md(scan_id: str):
+    scan, tool_runs, findings = _get_scan_bundle(scan_id)
+    md = render_scan_report_md(scan=scan, tool_runs=tool_runs, findings=findings)
+    return PlainTextResponse(content=md, media_type="text/markdown; charset=utf-8")

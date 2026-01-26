@@ -67,3 +67,17 @@ Each scan stores who triggered it via `triggered_by` and which API key was used 
 
 	- `curl -s -X POST http://localhost:8000/scan -H 'Content-Type: application/json' -H 'Authorization: Bearer changeme' -H 'X-Triggered-By: local' -d '{"target":"http://juiceshop:3000","concurrency_cap":10}' | jq`
 
+4. Watch progress (optional):
+
+	- `curl -s http://localhost:8000/scan/<scan_id> | jq`
+
+5. Get reports:
+
+	- JSON summary: `curl -s http://localhost:8000/scans/<scan_id>/summary | jq`
+	- Markdown report: `curl -s http://localhost:8000/scans/<scan_id>/report.md`
+
+You can also browse the API in the FastAPI docs:
+
+- Swagger UI: `http://localhost:8000/docs`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
+
