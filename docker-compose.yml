@@ -23,6 +23,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-rt}:${POSTGRES_PASSWORD:-rt}@db:5432/${POSTGRES_DB:-rt}}
       # API auth
       API_KEYS: ${API_KEYS:?Set API_KEYS (e.g., 'local=changeme')}
+      DEFAULT_TRIGGERED_BY: ${DEFAULT_TRIGGERED_BY:-local}
+      DEFAULT_TRIGGERED_VIA: ${DEFAULT_TRIGGERED_VIA:-api}
       # Scope control / safety gates
       SCAN_ALLOWLIST: ${SCAN_ALLOWLIST:?Set SCAN_ALLOWLIST (e.g., 'juiceshop,example.com')}
       LAB_MODE: ${LAB_MODE:-0}

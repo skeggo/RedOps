@@ -25,90 +25,143 @@ def log(msg: str):
 
 def init_db():
     with engine.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS scans (
-          id TEXT PRIMARY KEY,
-          target TEXT NOT NULL,
-          api_key_id TEXT NOT NULL DEFAULT 'unknown',
-          triggered_by TEXT NOT NULL DEFAULT 'unknown',
-          concurrency_cap INT NULL,
-          status TEXT NOT NULL,
-          created_at TIMESTAMP NOT NULL
-        );
-        """))
-
-        # Add new columns to existing installs (best-effort in-app migration).
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NOT NULL DEFAULT 'unknown'"))
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'unknown'"))
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
-        conn.execute(text("""
-          CREATE TABLE IF NOT EXISTS findings (
-          id SERIAL PRIMARY KEY,
-          scan_id TEXT NOT NULL,
-          tool TEXT NOT NULL,
-          payload JSONB NOT NULL,
-          created_at TIMESTAMP NOT NULL
-        );
-        """))
-
-        # Best-effort in-app migration from the legacy MVP schema (tool_runs without `id`).
-        conn.execute(text("""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_schema='public' AND table_name='tool_runs'
-                ) THEN
-                IF NOT EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name='tool_runs' AND column_name='id'
-                ) THEN
-                    IF NOT EXISTS (
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema='public' AND table_name='tool_runs_legacy'
-                    ) THEN
-                    ALTER TABLE public.tool_runs RENAME TO tool_runs_legacy;
-                    END IF;
-                END IF;
-                END IF;
-            END $$;
-            """
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS scans (
+                  id TEXT PRIMARY KEY,
+                  target TEXT NOT NULL,
+                  api_key_id TEXT NULL,
+                  triggered_by TEXT NOT NULL DEFAULT 'local',
+                  triggered_via TEXT NOT NULL DEFAULT 'api',
+                  request_ip INET NULL,
+                  concurrency_cap INT NULL,
+                  status TEXT NOT NULL,
+                  created_at TIMESTAMP NOT NULL
+                );
+                """
             )
         )
 
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS tool_runs (
-            id UUID PRIMARY KEY,
-            scan_id TEXT NOT NULL,
-            tool TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempt INT NOT NULL,
-            queued_at TIMESTAMP NOT NULL,
-            started_at TIMESTAMP NULL,
-            finished_at TIMESTAMP NULL,
-            duration_ms BIGINT NULL,
-            exit_code INT NULL,
-            stdout_path TEXT NULL,
-            stderr_path TEXT NULL,
-            artifact_path TEXT NULL,
-            args JSONB NOT NULL DEFAULT '{}'::jsonb,
-            short_error TEXT NULL,
-            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-            CONSTRAINT tool_runs_attempt_positive CHECK (attempt >= 1),
-            CONSTRAINT tool_runs_scan_tool_attempt_unique UNIQUE (scan_id, tool, attempt)
-        );
-        """))
+        # Add new columns to existing installs (best-effort in-app migration).
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NULL"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'local'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_via TEXT NOT NULL DEFAULT 'api'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS request_ip INET NULL"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
+
+        conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_by SET DEFAULT 'local'"))
+        conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_via SET DEFAULT 'api'"))
+        conn.execute(text("UPDATE scans SET triggered_by='local' WHERE triggered_by='unknown'"))
+        conn.execute(text("UPDATE scans SET api_key_id=NULL WHERE api_key_id='unknown'"))
+
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    ALTER TABLE scans ALTER COLUMN api_key_id DROP NOT NULL;
+                EXCEPTION WHEN others THEN
+                    NULL;
+                END $$;
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    ALTER TABLE scans ALTER COLUMN api_key_id DROP DEFAULT;
+                EXCEPTION WHEN others THEN
+                    NULL;
+                END $$;
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS findings (
+                  id SERIAL PRIMARY KEY,
+                  scan_id TEXT NOT NULL,
+                  tool TEXT NOT NULL,
+                  payload JSONB NOT NULL,
+                  created_at TIMESTAMP NOT NULL
+                );
+                """
+            )
+        )
+
+        # Best-effort in-app migration from the legacy MVP schema (tool_runs without `id`).
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_schema='public' AND table_name='tool_runs'
+                    ) THEN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema='public' AND table_name='tool_runs' AND column_name='id'
+                        ) THEN
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM information_schema.tables
+                                WHERE table_schema='public' AND table_name='tool_runs_legacy'
+                            ) THEN
+                                ALTER TABLE public.tool_runs RENAME TO tool_runs_legacy;
+                            END IF;
+                        END IF;
+                    END IF;
+                END $$;
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS tool_runs (
+                    id UUID PRIMARY KEY,
+                    scan_id TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INT NOT NULL,
+                    queued_at TIMESTAMP NOT NULL,
+                    started_at TIMESTAMP NULL,
+                    finished_at TIMESTAMP NULL,
+                    duration_ms BIGINT NULL,
+                    exit_code INT NULL,
+                    stdout_path TEXT NULL,
+                    stderr_path TEXT NULL,
+                    artifact_path TEXT NULL,
+                    args JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    short_error TEXT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    CONSTRAINT tool_runs_attempt_positive CHECK (attempt >= 1),
+                    CONSTRAINT tool_runs_scan_tool_attempt_unique UNIQUE (scan_id, tool, attempt)
+                );
+                """
+            )
+        )
 
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tool_runs_scan_timeline ON tool_runs (scan_id, queued_at)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tool_runs_scan_tool_attempt ON tool_runs (scan_id, tool, attempt)"))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_tool_runs_failed_recent
-            ON tool_runs (finished_at DESC)
-            WHERE status IN ('failed','timeout')
-        """))
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tool_runs_failed_recent
+                ON tool_runs (finished_at DESC)
+                WHERE status IN ('failed','timeout')
+                """
+            )
+        )
 
 
 def _tail(s: str | None, n: int) -> str | None:

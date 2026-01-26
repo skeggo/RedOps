@@ -20,8 +20,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS scans (
           id TEXT PRIMARY KEY,
           target TEXT NOT NULL,
-          api_key_id TEXT NOT NULL DEFAULT 'unknown',
-          triggered_by TEXT NOT NULL DEFAULT 'unknown',
+          api_key_id TEXT NULL,
+          triggered_by TEXT NOT NULL DEFAULT 'local',
+          triggered_via TEXT NOT NULL DEFAULT 'api',
+          request_ip INET NULL,
           concurrency_cap INT NULL,
           status TEXT NOT NULL,
           created_at TIMESTAMP NOT NULL
@@ -29,8 +31,42 @@ def init_db():
         """))
 
         # Add new columns to existing installs (best-effort in-app migration).
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NOT NULL DEFAULT 'unknown'"))
-        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'unknown'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS api_key_id TEXT NULL"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_by TEXT NOT NULL DEFAULT 'local'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS triggered_via TEXT NOT NULL DEFAULT 'api'"))
+        conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS request_ip INET NULL"))
+
+        # Align legacy defaults.
+        conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_by SET DEFAULT 'local'"))
+        conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_via SET DEFAULT 'api'"))
+        conn.execute(text("UPDATE scans SET triggered_by='local' WHERE triggered_by='unknown'"))
+
+        # api_key_id used to be NOT NULL DEFAULT 'unknown' (older installs). Make it nullable.
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    ALTER TABLE scans ALTER COLUMN api_key_id DROP NOT NULL;
+                EXCEPTION WHEN others THEN
+                    NULL;
+                END $$;
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    ALTER TABLE scans ALTER COLUMN api_key_id DROP DEFAULT;
+                EXCEPTION WHEN others THEN
+                    NULL;
+                END $$;
+                """
+            )
+        )
+        conn.execute(text("UPDATE scans SET api_key_id=NULL WHERE api_key_id='unknown'"))
         conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS findings (
@@ -107,11 +143,27 @@ def create_scan(body: dict, request: Request):
     if not target:
         raise HTTPException(status_code=400, detail="Missing target")
 
+    # Who launched the scan:
+    # - Prefer X-Actor
+    # - Fallback to DEFAULT_TRIGGERED_BY
+    default_triggered_by = os.getenv("DEFAULT_TRIGGERED_BY", "local")
     triggered_by = (
-        request.headers.get("X-Triggered-By")
+        request.headers.get("X-Actor")
+        or request.headers.get("X-Username")
+        or request.headers.get("X-Triggered-By")
         or body.get("triggered_by")
-        or os.getenv("TRIGGERED_BY", "local")
+        or default_triggered_by
     )
+
+    triggered_via = (
+        request.headers.get("X-Triggered-Via")
+        or body.get("triggered_via")
+        or os.getenv("DEFAULT_TRIGGERED_VIA", "api")
+    )
+
+    request_ip = None
+    if request.client and request.client.host:
+        request_ip = request.client.host
 
     concurrency_cap = body.get("concurrency_cap")
     if concurrency_cap is None:
@@ -133,15 +185,17 @@ def create_scan(body: dict, request: Request):
         conn.execute(
             text(
                 """
-                INSERT INTO scans (id, target, api_key_id, triggered_by, concurrency_cap, status, created_at)
-                VALUES (:id,:t,:kid,:by,:cap,:s,:c)
+                INSERT INTO scans (id, target, api_key_id, triggered_by, triggered_via, request_ip, concurrency_cap, status, created_at)
+                VALUES (:id,:t,:kid,:by,:via,:ip,:cap,:s,:c)
                 """
             ),
             {
                 "id": scan_id,
                 "t": str(target),
-                "kid": str(api_key_id),
+                "kid": str(api_key_id) if api_key_id is not None else None,
                 "by": str(triggered_by),
+                "via": str(triggered_via),
+                "ip": request_ip,
                 "cap": concurrency_cap,
                 "s": "queued",
                 "c": datetime.utcnow(),
@@ -152,6 +206,8 @@ def create_scan(body: dict, request: Request):
         "status": "queued",
         "api_key_id": str(api_key_id),
         "triggered_by": str(triggered_by),
+        "triggered_via": str(triggered_via),
+        "request_ip": request_ip,
         "concurrency_cap": concurrency_cap,
         "scope": validation,
     }
