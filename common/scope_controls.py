@@ -52,15 +52,29 @@ def load_allowlist(env_var: str = "SCAN_ALLOWLIST") -> Allowlist:
                 i = i[len(prefix) :].strip()
                 break
 
-        if "/" in i:
+        # CIDR entries.
+        if "/" in i and "://" not in i:
             try:
                 cidrs.append(ipaddress.ip_network(i, strict=False))
                 continue
-            except Exception as e:
-                raise ScopeError(f"Invalid CIDR in allowlist: {item} ({e})")
+            except Exception:
+                # Might be a URL/path-ish token like "example.com/path".
+                pass
+
+        # Normalize URL-ish and host:port entries to just the host.
+        host = _extract_host(i)
+
+        # Single IP entries (no CIDR) are allowed; treat them as /32 or /128.
+        try:
+            ip = ipaddress.ip_address(host)
+            prefix = 32 if isinstance(ip, ipaddress.IPv4Address) else 128
+            cidrs.append(ipaddress.ip_network(f"{host}/{prefix}", strict=False))
+            continue
+        except Exception:
+            pass
 
         # Normalize host-like tokens.
-        i = i.rstrip(".").lower()
+        i = host.rstrip(".").lower()
 
         # Treat single-label names as lab services (exact match only).
         if "." not in i and i not in ("localhost", "host.docker.internal"):
@@ -75,6 +89,20 @@ def _extract_host(target: str) -> str:
     t = (target or "").strip()
     if not t:
         raise ScopeError("Missing target")
+
+    # Fast-path: plain IP literals (including IPv6 without brackets).
+    ip_candidate = t
+    if ip_candidate.startswith("[") and ip_candidate.endswith("]"):
+        ip_candidate = ip_candidate[1:-1]
+    try:
+        ipaddress.ip_address(ip_candidate)
+        host = ip_candidate
+        host = (host or "").strip().rstrip(".").lower()
+        if not host:
+            raise ScopeError("Invalid target (could not extract host)")
+        return host
+    except Exception:
+        pass
 
     # Parse URL-ish strings.
     if "://" in t:

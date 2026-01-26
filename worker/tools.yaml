@@ -2,25 +2,36 @@ tools:
   - name: subfinder
     type: github_zip
     repo: projectdiscovery/subfinder
-    asset_regex: "linux_amd64\\.zip$"
+    version: "v2.12.0"
+    asset_regex: "{arch}\\.zip$"
     bin_name: subfinder
 
   - name: httpx
     type: github_zip
     repo: projectdiscovery/httpx
-    asset_regex: "linux_amd64\\.zip$"
+    version: "v1.8.1"
+    asset_regex: "{arch}\\.zip$"
     bin_name: httpx
+
+  - name: katana
+    type: github_zip
+    repo: projectdiscovery/katana
+    version: "v1.4.0"
+    asset_regex: "{arch}\\.zip$"
+    bin_name: katana
 
   - name: nuclei
     type: github_zip
     repo: projectdiscovery/nuclei
-    asset_regex: "linux_amd64\\.zip$"
+    version: "v3.6.2"
+    asset_regex: "{arch}\\.zip$"
     bin_name: nuclei
 
   - name: ffuf
     type: github_targz
     repo: ffuf/ffuf
-    asset_regex: "linux_amd64\\.tar\\.gz$"
+    version: "v2.1.0"
+    asset_regex: "{arch}\\.tar\\.gz$"
     bin_name: ffuf
 
   - name: nikto

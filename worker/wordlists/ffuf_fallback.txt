@@ -1,0 +1,10 @@
+# Small deterministic fallback wordlist for ffuf
+# One entry per line.
+admin
+login
+api
+graphql
+swagger
+docs
+robots.txt
+sitemap.xml

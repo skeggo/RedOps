@@ -35,8 +35,12 @@ def detect_arch_token() -> str:
 	raise RuntimeError(f"Unsupported architecture: {machine}")
 
 
-def github_latest_release_asset(repo: str, asset_regex: str) -> tuple[str, str]:
-	api = f"https://api.github.com/repos/{repo}/releases/latest"
+
+def github_release_asset(repo: str, asset_regex: str, version: str | None) -> tuple[str, str]:
+	if version and version != "latest":
+		api = f"https://api.github.com/repos/{repo}/releases/tags/{version}"
+	else:
+		api = f"https://api.github.com/repos/{repo}/releases/latest"
 	req = urllib.request.Request(
 		api,
 		headers={"Accept": "application/vnd.github+json", "User-Agent": "install-tools"},
@@ -54,7 +58,7 @@ def github_latest_release_asset(repo: str, asset_regex: str) -> tuple[str, str]:
 				continue
 			return name, url
 
-	raise RuntimeError(f"No asset matched regex={asset_regex} for repo={repo}")
+	raise RuntimeError(f"No asset matched regex={asset_regex} for repo={repo} version={version or 'latest'}")
 
 
 def download(url: str, dst: Path) -> None:
@@ -72,10 +76,11 @@ def ensure_executable(path: Path) -> None:
 		pass
 
 
-def install_github_zip(repo: str, asset_regex: str, bin_name: str, arch_token: str) -> None:
+
+def install_github_zip(repo: str, asset_regex: str, bin_name: str, arch_token: str, version: str | None) -> None:
 	regex = asset_regex.replace("{arch}", arch_token)
-	asset_name, url = github_latest_release_asset(repo, regex)
-	log(f"github_zip {repo} asset={asset_name}")
+	asset_name, url = github_release_asset(repo, regex, version)
+	log(f"github_zip {repo} version={version or 'latest'} asset={asset_name}")
 
 	zip_path = Path("/tmp") / asset_name
 	download(url, zip_path)
@@ -98,10 +103,11 @@ def install_github_zip(repo: str, asset_regex: str, bin_name: str, arch_token: s
 	shutil.rmtree(extracted, ignore_errors=True)
 
 
-def install_github_targz(repo: str, asset_regex: str, bin_name: str, arch_token: str) -> None:
+
+def install_github_targz(repo: str, asset_regex: str, bin_name: str, arch_token: str, version: str | None) -> None:
 	regex = asset_regex.replace("{arch}", arch_token)
-	asset_name, url = github_latest_release_asset(repo, regex)
-	log(f"github_targz {repo} asset={asset_name}")
+	asset_name, url = github_release_asset(repo, regex, version)
+	log(f"github_targz {repo} version={version or 'latest'} asset={asset_name}")
 
 	tgz_path = Path("/tmp") / asset_name
 	download(url, tgz_path)
@@ -153,6 +159,7 @@ def main() -> int:
 	for t in tools:
 		name = t.get("name")
 		ttype = t.get("type")
+		version = t.get("version")
 		if not name or not ttype:
 			continue
 
@@ -162,6 +169,7 @@ def main() -> int:
 				asset_regex=t["asset_regex"],
 				bin_name=t["bin_name"],
 				arch_token=arch_token,
+				version=version,
 			)
 		elif ttype == "github_targz":
 			install_github_targz(
@@ -169,6 +177,7 @@ def main() -> int:
 				asset_regex=t["asset_regex"],
 				bin_name=t["bin_name"],
 				arch_token=arch_token,
+				version=version,
 			)
 		elif ttype == "git":
 			install_git(

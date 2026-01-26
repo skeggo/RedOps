@@ -62,3 +62,7 @@ node_modules/
 # Misc
 *.sqlite3
 .env
+
+# Large wordlists (avoid accidentally committing huge files)
+worker/wordlists/directory-list-2.3-medium.txt
+worker/wordlists/directory-list-*.txt

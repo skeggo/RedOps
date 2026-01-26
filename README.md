@@ -53,9 +53,11 @@ Each scan stores who triggered it via `triggered_by` and which API key was used 
 
 ## Quick start
 
+Note (Linux): if you see `permission denied while trying to connect to the Docker daemon socket`, run compose with `sudo` (e.g. `sudo docker compose up --build`) or add your user to the `docker` group and re-login.
+
 1. Set env vars (at minimum):
 
-	- `SCAN_ALLOWLIST=juiceshop`
+	- `SCAN_ALLOWLIST=juiceshop,host.docker.internal`
 	- `LAB_MODE=1`
 	- `API_KEYS=local=changeme`
 

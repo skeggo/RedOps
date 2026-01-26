@@ -206,6 +206,15 @@ def _ensure_dir(path: str):
 
 
 TOOL_RUNS_DIR = os.getenv("TOOL_RUNS_DIR", "/tmp/tool_runs")
+ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "/tmp/artifacts")
+
+
+PRIMARY_ARTIFACT_NAMES: dict[str, str] = {
+    "httpx": "httpx.jsonl",
+    "katana": "katana_urls.txt",
+    "nuclei": "nuclei.jsonl",
+    "ffuf": "ffuf.json",
+}
 
 
 TOOL_ARTIFACTS: dict[str, list[str]] = {
@@ -439,11 +448,14 @@ def run_pipeline(scan_id: str, target: str, mode: str):
         "fast_mode": FAST_MODE,
         "subdomains": [],
         "urls": [],
+        "katana_urls": [],
+        "ffuf_urls": [],
         "concurrency_cap": scan_concurrency_cap_int,
         # Inject helpers for plugins
         "run": run,
         "log": log,
         "env": dict(os.environ),
+        "insert_finding": insert_finding,
     }
 
     for spec in tools:
@@ -494,6 +506,20 @@ def run_pipeline(scan_id: str, target: str, mode: str):
         open(stdout_path, "a").close()
         open(stderr_path, "a").close()
 
+        scan_artifacts_dir = os.path.join(ARTIFACTS_DIR, scan_id)
+        _ensure_dir(scan_artifacts_dir)
+
+        artifact_name = spec.get("artifact_name") or PRIMARY_ARTIFACT_NAMES.get(name) or f"{name}.artifact"
+        # Avoid overwriting artifacts if retries happen.
+        if attempt and int(attempt) > 1:
+            if "." in artifact_name:
+                base, ext = artifact_name.rsplit(".", 1)
+                artifact_name = f"{base}_attempt{attempt}.{ext}"
+            else:
+                artifact_name = f"{artifact_name}_attempt{attempt}"
+        artifact_path = os.path.join(scan_artifacts_dir, str(artifact_name))
+        open(artifact_path, "a").close()
+
         # Back-fill file paths now that attempt is known.
         with engine.begin() as conn:
             conn.execute(
@@ -504,11 +530,18 @@ def run_pipeline(scan_id: str, target: str, mode: str):
                     WHERE id=:id
                     """
                 ),
-                {"id": run_id, "stdout_path": stdout_path, "stderr_path": stderr_path, "artifact_path": artifact_dir},
+                {"id": run_id, "stdout_path": stdout_path, "stderr_path": stderr_path, "artifact_path": artifact_path},
             )
 
         recorder = ToolRunRecorder(stdout_path=stdout_path, stderr_path=stderr_path)
         ctx["_tool_run_recorder"] = recorder
+
+        # Per-tool invocation context.
+        ctx["tool_run_id"] = run_id
+        ctx["tool_attempt"] = attempt
+        ctx["artifact_path"] = artifact_path
+        ctx["run_dir"] = artifact_dir
+        ctx["scan_artifacts_dir"] = scan_artifacts_dir
 
         started_at = None
 

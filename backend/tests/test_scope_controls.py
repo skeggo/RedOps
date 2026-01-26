@@ -43,6 +43,26 @@ class ScopeControlsTests(unittest.TestCase):
             out = scope_controls.validate_target("http://juiceshop:3000", allowlist=al, lab_mode=False)
         self.assertEqual(out["host"], "juiceshop")
 
+    def test_allowlist_accepts_url_and_hostport_tokens(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SCAN_ALLOWLIST": "https://example.com/path,example.com:443"},
+            clear=False,
+        ):
+            al = scope_controls.load_allowlist()
+
+        # Avoid DNS dependence.
+        with mock.patch.object(scope_controls, "_resolve_ips", return_value=[]):
+            out = scope_controls.validate_target("http://example.com:8080", allowlist=al, lab_mode=False)
+        self.assertEqual(out["host"], "example.com")
+
+    def test_allowlist_accepts_single_ip_literal(self):
+        with mock.patch.dict(os.environ, {"SCAN_ALLOWLIST": "1.2.3.4"}, clear=False):
+            al = scope_controls.load_allowlist()
+
+        out = scope_controls.validate_target("1.2.3.4", allowlist=al, lab_mode=False)
+        self.assertEqual(out["host"], "1.2.3.4")
+
     def test_ip_literal_must_be_in_cidr(self):
         with mock.patch.dict(os.environ, {"SCAN_ALLOWLIST": "1.2.3.0/24"}, clear=False):
             al = scope_controls.load_allowlist()

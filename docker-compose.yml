@@ -41,6 +41,7 @@ services:
       dockerfile: worker/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-rt}:${POSTGRES_PASSWORD:-rt}@db:5432/${POSTGRES_DB:-rt}}
+      PIPELINE: ${PIPELINE:-web_pentest_v1}
       # Scope control / safety gates
       SCAN_ALLOWLIST: ${SCAN_ALLOWLIST:?Set SCAN_ALLOWLIST (e.g., 'juiceshop,example.com')}
       LAB_MODE: ${LAB_MODE:-0}
