@@ -11,6 +11,7 @@ import yaml
 
 from tools.plugin import load_tool
 from scope_controls import ScopeError, load_allowlist, validate_target
+from common.normalizer import normalize_and_fingerprint
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, future=True)
@@ -87,9 +88,23 @@ def init_db():
                   id SERIAL PRIMARY KEY,
                   scan_id TEXT NOT NULL,
                   tool TEXT NOT NULL,
+                  fingerprint TEXT NULL,
                   payload JSONB NOT NULL,
                   created_at TIMESTAMP NOT NULL
                 );
+                """
+            )
+        )
+
+        # Best-effort migration for existing installs.
+        conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint TEXT NULL"))
+        # Enforce dedupe for new rows (existing NULL fingerprints won't participate).
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_scan_fingerprint_unique
+                ON findings (scan_id, fingerprint)
+                WHERE fingerprint IS NOT NULL
                 """
             )
         )
@@ -370,12 +385,74 @@ def run(cmd: list[str], timeout: int = 600, recorder: ToolRunRecorder | None = N
     return (p.stdout or "").strip()
 
 
-def insert_finding(scan_id: str, tool: str, payload: dict):
+def insert_finding(scan_id: str, tool: str, payload: dict) -> bool:
+    normalized_payload, fingerprint = normalize_and_fingerprint(tool, payload)
     with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO findings (scan_id, tool, payload, created_at) VALUES (:id,:tool,:p,:c)"),
-            {"id": scan_id, "tool": tool, "p": json.dumps(payload), "c": datetime.utcnow()},
+        res = conn.execute(
+            text(
+                """
+                INSERT INTO findings (scan_id, tool, fingerprint, payload, created_at)
+                VALUES (:id,:tool,:fp,:p,:c)
+                ON CONFLICT (scan_id, fingerprint)
+                WHERE fingerprint IS NOT NULL
+                DO NOTHING
+                """
+            ),
+            {
+                "id": scan_id,
+                "tool": tool,
+                "fp": fingerprint,
+                "p": json.dumps(normalized_payload),
+                "c": datetime.utcnow(),
+            },
         )
+    try:
+        return bool(res.rowcount)
+    except Exception:
+        return True
+
+
+def insert_findings_bulk(scan_id: str, tool: str, payloads: list[dict]) -> int:
+    """Insert many findings in a single transaction.
+
+    This is primarily to keep high-volume tools (e.g. nuclei) from spending most
+    of their runtime on per-row transaction overhead.
+    """
+
+    if not payloads:
+        return 0
+
+    inserted = 0
+    now = datetime.utcnow()
+    with engine.begin() as conn:
+        stmt = text(
+            """
+            INSERT INTO findings (scan_id, tool, fingerprint, payload, created_at)
+            VALUES (:id,:tool,:fp,:p,:c)
+            ON CONFLICT (scan_id, fingerprint)
+            WHERE fingerprint IS NOT NULL
+            DO NOTHING
+            """
+        )
+
+        for payload in payloads:
+            normalized_payload, fingerprint = normalize_and_fingerprint(tool, payload)
+            res = conn.execute(
+                stmt,
+                {
+                    "id": scan_id,
+                    "tool": tool,
+                    "fp": fingerprint,
+                    "p": json.dumps(normalized_payload),
+                    "c": now,
+                },
+            )
+            try:
+                inserted += int(res.rowcount or 0)
+            except Exception:
+                inserted += 1
+
+    return inserted
 
 
 def set_status(scan_id: str, status: str):
@@ -458,6 +535,7 @@ def run_pipeline(scan_id: str, target: str, mode: str):
         "log": log,
         "env": dict(os.environ),
         "insert_finding": insert_finding,
+        "insert_findings_bulk": insert_findings_bulk,
     }
 
     for spec in tools:

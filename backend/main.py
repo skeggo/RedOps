@@ -22,7 +22,7 @@ def _get_scan_bundle(scan_id: str) -> tuple[dict, list[dict], list[dict]]:
             raise HTTPException(status_code=404, detail="Scan not found")
 
         findings = conn.execute(
-            text("SELECT tool, payload, created_at FROM findings WHERE scan_id=:id ORDER BY id ASC"),
+            text("SELECT tool, fingerprint, payload, created_at FROM findings WHERE scan_id=:id ORDER BY id ASC"),
             {"id": scan_id},
         ).mappings().all()
 
@@ -63,15 +63,34 @@ def init_db():
         conn.execute(text("ALTER TABLE scans ALTER COLUMN triggered_by SET DEFAULT 'local'"))
         conn.execute(text("UPDATE scans SET triggered_by='local' WHERE triggered_by='unknown'"))
         conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS concurrency_cap INT NULL"))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS findings (
-          id SERIAL PRIMARY KEY,
-          scan_id TEXT NOT NULL,
-          tool TEXT NOT NULL,
-          payload JSONB NOT NULL,
-          created_at TIMESTAMP NOT NULL
-        );
-        """))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS findings (
+                    id SERIAL PRIMARY KEY,
+                    scan_id TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    fingerprint TEXT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMP NOT NULL
+                );
+                """
+            )
+        )
+
+        # Best-effort migration for existing installs.
+        conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint TEXT NULL"))
+        # Enforce dedupe for new rows (existing NULL fingerprints won't participate).
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_scan_fingerprint_unique
+                ON findings (scan_id, fingerprint)
+                WHERE fingerprint IS NOT NULL
+                """
+            )
+        )
 
         # Best-effort in-app migration from the legacy MVP schema (tool_runs without `id`).
         conn.execute(text("""
