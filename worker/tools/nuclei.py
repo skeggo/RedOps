@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 NAME = "nuclei"
 
@@ -15,7 +16,60 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
     args = args or {}
     runner = ctx["run"]
 
-    base_urls: list[str] = [str(u) for u in (ctx.get("urls") or []) if str(u).strip()]
+    def _hostport(u: str) -> tuple[str | None, int | None]:
+        try:
+            parts = urlsplit(str(u))
+        except Exception:
+            return None, None
+        host = (parts.hostname or "").strip().lower() or None
+        port = parts.port
+        if port is None and parts.scheme in ("http", "https"):
+            port = 80 if parts.scheme == "http" else 443
+        return host, port
+
+    def _base_url(u: str) -> str | None:
+        """Return scheme://host[:port] for a URL."""
+        s = str(u or "").strip()
+        if not s:
+            return None
+        if not (s.startswith("http://") or s.startswith("https://")):
+            return None
+        try:
+            parts = urlsplit(s)
+        except Exception:
+            return None
+        scheme = (parts.scheme or "").lower()
+        netloc = (parts.netloc or "").lower()
+        if not scheme or not netloc:
+            return None
+        return f"{scheme}://{netloc}"
+
+    target_url = str(ctx.get("target") or "").strip()
+    prefer_target_only = bool(args.get("prefer_target_only", True))
+
+    base_urls: list[str]
+    if prefer_target_only and (target_url.startswith("http://") or target_url.startswith("https://")):
+        base = _base_url(target_url) or target_url
+        base_urls = [base]
+    else:
+        base_urls = [str(u) for u in (ctx.get("urls") or []) if str(u).strip()]
+
+    # Normalize base URLs down to scheme://host[:port] and dedupe.
+    normalized_bases: list[str] = []
+    seen_bases: set[str] = set()
+    for u in base_urls:
+        b = _base_url(u) or str(u).strip()
+        if not b or b in seen_bases:
+            continue
+        seen_bases.add(b)
+        normalized_bases.append(b)
+    base_urls = normalized_bases
+
+    max_base_urls = int(args.get("max_base_urls", 5))
+    if max_base_urls >= 0:
+        base_urls = base_urls[: max(0, max_base_urls)]
+
+    target_host, target_port = _hostport(target_url) if target_url else (None, None)
     katana_urls: list[str] = [str(u) for u in (ctx.get("katana_urls") or []) if str(u).strip()]
     ffuf_urls: list[str] = [str(u) for u in (ctx.get("ffuf_urls") or []) if str(u).strip()]
 
@@ -24,8 +78,30 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
     # Bound scan size so runs finish deterministically.
     max_katana = int(args.get("max_katana_urls", 2000))
     max_targets = int(args.get("max_targets", 2500))
+    max_ffuf = int(args.get("max_ffuf_urls", 500))
 
-    targets = base_urls + katana_urls[: max(0, max_katana)] + ffuf_urls
+    # Fast default: only scan base URL(s). Nuclei templates generate their own paths.
+    if prefer_target_only:
+        katana_urls = []
+        ffuf_urls = []
+
+    # If we are focusing on the original target, filter katana/ffuf URLs to that host:port.
+    if prefer_target_only and target_host:
+        filtered_katana: list[str] = []
+        for u in katana_urls:
+            h, p = _hostport(u)
+            if h == target_host and (target_port is None or p == target_port):
+                filtered_katana.append(u)
+        katana_urls = filtered_katana
+
+        filtered_ffuf: list[str] = []
+        for u in ffuf_urls:
+            h, p = _hostport(u)
+            if h == target_host and (target_port is None or p == target_port):
+                filtered_ffuf.append(u)
+        ffuf_urls = filtered_ffuf
+
+    targets = base_urls + katana_urls[: max(0, max_katana)] + ffuf_urls[: max(0, max_ffuf)]
 
     # De-dupe while preserving order.
     seen: set[str] = set()
@@ -95,6 +171,11 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
         retries = 1 if fast_mode else 2
 
     cmd = ["nuclei", "-jsonl", "-silent", "-duc"]
+
+    stats_enabled = bool(args.get("stats", True))
+    stats_interval = args.get("stats_interval", 5)
+    if stats_enabled:
+        cmd += ["-stats", "-stats-interval", str(stats_interval)]
     if templates:
         cmd += ["-t", str(templates)]
     cmd += ["-rate-limit", str(rate_limit)]
@@ -175,8 +256,12 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
         "count": len(findings),
         "inserted_findings": inserted,
         "scanned_urls": len(urls),
+        "prefer_target_only": prefer_target_only,
+        "max_base_urls": max_base_urls,
+        "base_url_count": len(base_urls),
         "max_targets": max_targets,
         "max_katana_urls": max_katana,
+        "max_ffuf_urls": max_ffuf,
         "used_templates": templates,
         "rate_limit": rate_limit,
         "concurrency": concurrency,

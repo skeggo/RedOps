@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.parse import urldefrag
 
 NAME = "ffuf"
 
@@ -121,19 +122,42 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
         hits = []
 
     allowed_status = {200, 204, 301, 302, 401, 403}
+    # For downstream scanning, redirects tend to be noisy (login redirects, canonicalization, etc.).
+    include_redirects_downstream = bool(args.get("include_redirects_downstream", False))
+    allowed_status_downstream = {200, 204, 401, 403} | ({301, 302} if include_redirects_downstream else set())
+    max_urls_for_nuclei = int(args.get("max_urls_for_nuclei", 500))
 
-    # Provide ffuf-discovered URLs to downstream tools (e.g. nuclei).
+    def _normalize_url(u: str) -> str | None:
+        u = (u or "").strip()
+        if not u:
+            return None
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return None
+        u, _frag = urldefrag(u)
+        # Strip trailing slash for stability (except root).
+        if u.endswith("/") and len(u) > len("http://x/"):
+            u = u.rstrip("/")
+        return u
+
+    # Provide ffuf-discovered URLs to downstream tools (e.g. nuclei): de-dupe + cap.
     ffuf_urls: list[str] = []
+    seen_urls: set[str] = set()
+    truncated = False
     for h in hits:
         try:
             status = int(h.get("status"))
         except Exception:
             continue
-        if status not in allowed_status:
+        if status not in allowed_status_downstream:
             continue
-        u = str(h.get("url") or "").strip()
-        if u and u not in ffuf_urls:
-            ffuf_urls.append(u)
+        nu = _normalize_url(str(h.get("url") or ""))
+        if not nu or nu in seen_urls:
+            continue
+        seen_urls.add(nu)
+        ffuf_urls.append(nu)
+        if len(ffuf_urls) >= max(0, max_urls_for_nuclei):
+            truncated = True
+            break
     ctx["ffuf_urls"] = ffuf_urls
 
     inserted = 0
@@ -178,5 +202,8 @@ def run(ctx: dict[str, Any], *, timeout: int, args: dict[str, Any] | None = None
         "word_count": len(words),
         "hit_count": len(hits),
         "ffuf_url_count": len(ffuf_urls),
+        "ffuf_urls_truncated": truncated,
+        "max_urls_for_nuclei": max_urls_for_nuclei,
+        "include_redirects_downstream": include_redirects_downstream,
         "inserted_findings": inserted,
     }

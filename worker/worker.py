@@ -4,7 +4,9 @@ import time
 import uuid
 import subprocess
 import shutil
+import threading
 from datetime import datetime
+from urllib.parse import urlsplit
 from sqlalchemy import create_engine, text
 
 import yaml
@@ -89,6 +91,8 @@ def init_db():
                   scan_id TEXT NOT NULL,
                   tool TEXT NOT NULL,
                   fingerprint TEXT NULL,
+                  asset_id INT NULL,
+                  endpoint_id INT NULL,
                   payload JSONB NOT NULL,
                   created_at TIMESTAMP NOT NULL
                 );
@@ -98,6 +102,12 @@ def init_db():
 
         # Best-effort migration for existing installs.
         conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint TEXT NULL"))
+        conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS asset_id INT NULL"))
+        conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS endpoint_id INT NULL"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_findings_scan_id ON findings (scan_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_findings_asset_id ON findings (asset_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_findings_endpoint_id ON findings (endpoint_id)"))
         # Enforce dedupe for new rows (existing NULL fingerprints won't participate).
         conn.execute(
             text(
@@ -105,6 +115,70 @@ def init_db():
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_scan_fingerprint_unique
                 ON findings (scan_id, fingerprint)
                 WHERE fingerprint IS NOT NULL
+                """
+            )
+        )
+
+        # Assets/endpoints tables (scan-scoped; minimal fields for reporting).
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS assets (
+                  id SERIAL PRIMARY KEY,
+                  scan_id TEXT NOT NULL,
+                  host TEXT NOT NULL,
+                  port INT NULL,
+                  scheme TEXT NULL,
+                  tech JSONB NULL,
+                  headers_summary JSONB NULL,
+                  discovered_at TIMESTAMP NOT NULL
+                );
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS tech JSONB NULL"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS headers_summary JSONB NULL"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS discovered_at TIMESTAMP NOT NULL DEFAULT now()"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assets_scan_id ON assets (scan_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assets_host ON assets (host)"))
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_scan_host_port_scheme_unique
+                ON assets (scan_id, host, port, scheme)
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS endpoints (
+                  id SERIAL PRIMARY KEY,
+                  scan_id TEXT NOT NULL,
+                  asset_id INT NULL,
+                  url TEXT NOT NULL,
+                  method TEXT NOT NULL DEFAULT '',
+                  status INT NULL,
+                  title TEXT NULL,
+                  source TEXT NOT NULL,
+                  discovered_at TIMESTAMP NOT NULL
+                );
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS discovered_at TIMESTAMP NOT NULL DEFAULT now()"))
+        conn.execute(text("ALTER TABLE endpoints ALTER COLUMN method SET DEFAULT ''"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_endpoints_scan_id ON endpoints (scan_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_endpoints_asset_id ON endpoints (asset_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_endpoints_url ON endpoints (url)"))
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoints_scan_url_method_unique
+                ON endpoints (scan_id, url, method)
                 """
             )
         )
@@ -364,35 +438,299 @@ def update_tool_run(
 
 def run(cmd: list[str], timeout: int = 600, recorder: ToolRunRecorder | None = None) -> str:
     log("CMD: " + " ".join(cmd))
+
+    # Stream output into recorder files so long-running tools (e.g. nuclei -stats)
+    # can be tailed while running.
+    MAX_CAPTURE_CHARS = 5_000_000  # bound memory while still enabling parsing for most tools
+    stdout_parts: list[str] = []
+    captured_chars = 0
+    stderr_tail = ""
+    stderr_lock = threading.Lock()
+
+    def _read_stream(stream, *, is_stdout: bool):
+        nonlocal captured_chars, stderr_tail
+        try:
+            for line in iter(stream.readline, ""):
+                if recorder:
+                    recorder.append(line if is_stdout else None, None if is_stdout else line)
+                if is_stdout and captured_chars < MAX_CAPTURE_CHARS:
+                    stdout_parts.append(line)
+                    captured_chars += len(line)
+                if not is_stdout:
+                    with stderr_lock:
+                        stderr_tail = (stderr_tail + line)[-2000:]
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    t_out = threading.Thread(target=_read_stream, args=(p.stdout,), kwargs={"is_stdout": True}, daemon=True)
+    t_err = threading.Thread(target=_read_stream, args=(p.stderr,), kwargs={"is_stdout": False}, daemon=True)
+    t_out.start()
+    t_err.start()
+
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p.wait(timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        stderr = None
-        if getattr(e, "stderr", None):
-            stderr = e.stderr
-        elif getattr(e, "output", None):
-            stderr = e.output
+        try:
+            p.kill()
+        except Exception:
+            pass
+        with stderr_lock:
+            tail = stderr_tail
         if recorder:
-            recorder.observe_timeout(stderr=stderr)
+            recorder.observe_timeout(stderr=tail or str(e))
         raise
+    finally:
+        # Best-effort drain.
+        t_out.join(timeout=1)
+        t_err.join(timeout=1)
 
+    exit_code = int(p.returncode or 0)
     if recorder:
-        recorder.observe(p.returncode, p.stdout, p.stderr)
+        recorder.exit_code = exit_code
+        with stderr_lock:
+            recorder.stderr_tail = stderr_tail or None
 
-    if p.returncode != 0:
-        log("STDERR: " + (_tail(p.stderr, 500) or ""))
+    if exit_code != 0:
+        with stderr_lock:
+            log("STDERR: " + (_tail(stderr_tail, 500) or ""))
 
-    return (p.stdout or "").strip()
+    return ("".join(stdout_parts) or "").strip()
+
+
+def _url_to_asset_parts(url: str) -> tuple[str | None, str | None, int | None]:
+    """Return (scheme, host, port) for a URL-like string."""
+    u = (url or "").strip()
+    if not u:
+        return None, None, None
+
+    # Allow raw host:port in a pinch.
+    if "://" not in u and ("/" not in u) and (":" in u):
+        u = "http://" + u
+
+    try:
+        parts = urlsplit(u)
+    except Exception:
+        return None, None, None
+
+    scheme = (parts.scheme or "").lower() or None
+    host = (parts.hostname or "").strip().lower() or None
+    port = parts.port
+
+    if port is None and scheme in ("http", "https"):
+        port = 80 if scheme == "http" else 443
+
+    return scheme, host, port
+
+
+def _summarize_headers(headers: object) -> dict | None:
+    if not isinstance(headers, dict):
+        return None
+    out: dict[str, str] = {}
+    for k in ["server", "content-type", "x-powered-by", "strict-transport-security", "location"]:
+        for kk in (k, k.title(), k.upper()):
+            if kk in headers and headers.get(kk) is not None:
+                out[k] = str(headers.get(kk))
+                break
+    return out or None
+
+
+def _upsert_asset(
+    conn,
+    *,
+    scan_id: str,
+    host: str,
+    port: int | None,
+    scheme: str | None,
+    tech: dict | None,
+    headers_summary: dict | None,
+) -> int | None:
+    if not scan_id or not host:
+        return None
+    row = conn.execute(
+        text(
+            """
+            INSERT INTO assets (scan_id, host, port, scheme, tech, headers_summary, discovered_at)
+            VALUES (:scan_id, :host, :port, :scheme, CAST(:tech AS JSONB), CAST(:headers AS JSONB), :c)
+            ON CONFLICT (scan_id, host, port, scheme)
+            DO UPDATE SET
+              tech = COALESCE(EXCLUDED.tech, assets.tech),
+              headers_summary = COALESCE(EXCLUDED.headers_summary, assets.headers_summary)
+            RETURNING id
+            """
+        ),
+        {
+            "scan_id": scan_id,
+            "host": host,
+            "port": port,
+            "scheme": scheme,
+            "tech": json.dumps(tech) if tech is not None else None,
+            "headers": json.dumps(headers_summary) if headers_summary is not None else None,
+            "c": datetime.utcnow(),
+        },
+    ).mappings().first()
+    try:
+        return int(row["id"]) if row else None
+    except Exception:
+        return None
+
+
+def _upsert_endpoint(
+    conn,
+    *,
+    scan_id: str,
+    asset_id: int | None,
+    url: str,
+    method: str | None,
+    status: int | None,
+    title: str | None,
+    source: str,
+) -> int | None:
+    if not scan_id or not url or not source:
+        return None
+    m = (method or "").strip().upper()
+    row = conn.execute(
+        text(
+            """
+            INSERT INTO endpoints (scan_id, asset_id, url, method, status, title, source, discovered_at)
+            VALUES (:scan_id, :asset_id, :url, :method, :status, :title, :source, :c)
+            ON CONFLICT (scan_id, url, method)
+            DO UPDATE SET
+              asset_id = COALESCE(endpoints.asset_id, EXCLUDED.asset_id),
+              status = COALESCE(EXCLUDED.status, endpoints.status),
+              title = COALESCE(EXCLUDED.title, endpoints.title)
+            RETURNING id
+            """
+        ),
+        {
+            "scan_id": scan_id,
+            "asset_id": asset_id,
+            "url": str(url),
+            "method": m,
+            "status": status,
+            "title": title,
+            "source": str(source),
+            "c": datetime.utcnow(),
+        },
+    ).mappings().first()
+    try:
+        return int(row["id"]) if row else None
+    except Exception:
+        return None
+
+
+def _derive_ids_for_finding(conn, *, scan_id: str, tool: str, payload: dict) -> tuple[int | None, int | None]:
+    t = (tool or "").strip().lower()
+
+    # Summary tools that include many URLs/results: populate tables, but don't force a single id.
+    if t == "httpx":
+        results = payload.get("results")
+        if isinstance(results, list):
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                u = str(r.get("url") or "").strip()
+                scheme, host, port = _url_to_asset_parts(u)
+                if not host:
+                    continue
+
+                tech: dict | None = None
+                try:
+                    tech = {
+                        "webserver": r.get("webserver"),
+                        "technologies": r.get("technologies") or r.get("tech"),
+                        "cdn": r.get("cdn"),
+                    }
+                except Exception:
+                    tech = None
+                tech = tech or None
+
+                headers_summary = _summarize_headers(r.get("header") or r.get("headers"))
+                asset_id = _upsert_asset(conn, scan_id=scan_id, host=host, port=port, scheme=scheme, tech=tech, headers_summary=headers_summary)
+                if u:
+                    _upsert_endpoint(
+                        conn,
+                        scan_id=scan_id,
+                        asset_id=asset_id,
+                        url=u,
+                        method=None,
+                        status=int(r.get("status_code")) if r.get("status_code") is not None else None,
+                        title=str(r.get("title") or "").strip() or None,
+                        source="httpx",
+                    )
+        return None, None
+
+    if t == "katana":
+        urls = payload.get("urls")
+        if isinstance(urls, list):
+            for u0 in urls:
+                u = str(u0 or "").strip()
+                scheme, host, port = _url_to_asset_parts(u)
+                if not host:
+                    continue
+                asset_id = _upsert_asset(conn, scan_id=scan_id, host=host, port=port, scheme=scheme, tech=None, headers_summary=None)
+                _upsert_endpoint(conn, scan_id=scan_id, asset_id=asset_id, url=u, method=None, status=None, title=None, source="katana")
+        return None, None
+
+    # Per-endpoint tools.
+    url = str(payload.get("url") or payload.get("matched_at") or payload.get("matched-at") or payload.get("host") or "").strip()
+    if not url:
+        return None, None
+
+    scheme, host, port = _url_to_asset_parts(url)
+    if not host:
+        return None, None
+
+    asset_id = _upsert_asset(conn, scan_id=scan_id, host=host, port=port, scheme=scheme, tech=None, headers_summary=None)
+
+    source = "unknown"
+    if t.startswith("ffuf"):
+        source = "ffuf"
+    elif t.startswith("nuclei"):
+        source = "nuclei"
+    elif t.startswith("nikto"):
+        source = "nikto"
+    elif t.startswith("httpx"):
+        source = "httpx"
+    elif t.startswith("katana"):
+        source = "katana"
+    else:
+        source = t or "unknown"
+
+    status = None
+    try:
+        if payload.get("status") is not None:
+            status = int(payload.get("status"))
+        elif payload.get("status_code") is not None:
+            status = int(payload.get("status_code"))
+    except Exception:
+        status = None
+
+    title = str(payload.get("endpoint_title") or payload.get("title") or "").strip() or None
+    method = payload.get("method")
+    endpoint_id = _upsert_endpoint(conn, scan_id=scan_id, asset_id=asset_id, url=url, method=str(method) if method else None, status=status, title=title, source=source)
+    return asset_id, endpoint_id
 
 
 def insert_finding(scan_id: str, tool: str, payload: dict) -> bool:
     normalized_payload, fingerprint = normalize_and_fingerprint(tool, payload)
     with engine.begin() as conn:
+        asset_id, endpoint_id = _derive_ids_for_finding(conn, scan_id=scan_id, tool=tool, payload=normalized_payload)
         res = conn.execute(
             text(
                 """
-                INSERT INTO findings (scan_id, tool, fingerprint, payload, created_at)
-                VALUES (:id,:tool,:fp,:p,:c)
+                INSERT INTO findings (scan_id, tool, fingerprint, asset_id, endpoint_id, payload, created_at)
+                VALUES (:id,:tool,:fp,:asset_id,:endpoint_id,:p,:c)
                 ON CONFLICT (scan_id, fingerprint)
                 WHERE fingerprint IS NOT NULL
                 DO NOTHING
@@ -402,6 +740,8 @@ def insert_finding(scan_id: str, tool: str, payload: dict) -> bool:
                 "id": scan_id,
                 "tool": tool,
                 "fp": fingerprint,
+                "asset_id": asset_id,
+                "endpoint_id": endpoint_id,
                 "p": json.dumps(normalized_payload),
                 "c": datetime.utcnow(),
             },
@@ -427,8 +767,8 @@ def insert_findings_bulk(scan_id: str, tool: str, payloads: list[dict]) -> int:
     with engine.begin() as conn:
         stmt = text(
             """
-            INSERT INTO findings (scan_id, tool, fingerprint, payload, created_at)
-            VALUES (:id,:tool,:fp,:p,:c)
+            INSERT INTO findings (scan_id, tool, fingerprint, asset_id, endpoint_id, payload, created_at)
+            VALUES (:id,:tool,:fp,:asset_id,:endpoint_id,:p,:c)
             ON CONFLICT (scan_id, fingerprint)
             WHERE fingerprint IS NOT NULL
             DO NOTHING
@@ -437,12 +777,15 @@ def insert_findings_bulk(scan_id: str, tool: str, payloads: list[dict]) -> int:
 
         for payload in payloads:
             normalized_payload, fingerprint = normalize_and_fingerprint(tool, payload)
+            asset_id, endpoint_id = _derive_ids_for_finding(conn, scan_id=scan_id, tool=tool, payload=normalized_payload)
             res = conn.execute(
                 stmt,
                 {
                     "id": scan_id,
                     "tool": tool,
                     "fp": fingerprint,
+                    "asset_id": asset_id,
+                    "endpoint_id": endpoint_id,
                     "p": json.dumps(normalized_payload),
                     "c": now,
                 },

@@ -22,7 +22,30 @@ def _get_scan_bundle(scan_id: str) -> tuple[dict, list[dict], list[dict]]:
             raise HTTPException(status_code=404, detail="Scan not found")
 
         findings = conn.execute(
-            text("SELECT tool, fingerprint, payload, created_at FROM findings WHERE scan_id=:id ORDER BY id ASC"),
+            text(
+                """
+                SELECT
+                  f.tool,
+                  f.fingerprint,
+                  f.payload,
+                  f.created_at,
+                  f.asset_id,
+                  f.endpoint_id,
+                  e.url AS endpoint_url,
+                  e.method AS endpoint_method,
+                  e.status AS endpoint_status,
+                  e.title AS endpoint_title,
+                  e.source AS endpoint_source,
+                  a.host AS asset_host,
+                  a.port AS asset_port,
+                  a.scheme AS asset_scheme
+                FROM findings f
+                LEFT JOIN endpoints e ON e.id = f.endpoint_id
+                LEFT JOIN assets a ON a.id = f.asset_id
+                WHERE f.scan_id = :id
+                ORDER BY f.id ASC
+                """
+            ),
             {"id": scan_id},
         ).mappings().all()
 
@@ -72,6 +95,8 @@ def init_db():
                     scan_id TEXT NOT NULL,
                     tool TEXT NOT NULL,
                     fingerprint TEXT NULL,
+                    asset_id INT NULL,
+                    endpoint_id INT NULL,
                     payload JSONB NOT NULL,
                     created_at TIMESTAMP NOT NULL
                 );
@@ -81,6 +106,12 @@ def init_db():
 
         # Best-effort migration for existing installs.
         conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint TEXT NULL"))
+        conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS asset_id INT NULL"))
+        conn.execute(text("ALTER TABLE findings ADD COLUMN IF NOT EXISTS endpoint_id INT NULL"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_findings_scan_id ON findings (scan_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_findings_asset_id ON findings (asset_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_findings_endpoint_id ON findings (endpoint_id)"))
         # Enforce dedupe for new rows (existing NULL fingerprints won't participate).
         conn.execute(
             text(
@@ -88,6 +119,70 @@ def init_db():
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_scan_fingerprint_unique
                 ON findings (scan_id, fingerprint)
                 WHERE fingerprint IS NOT NULL
+                """
+            )
+        )
+
+        # Assets/endpoints tables (scan-scoped; minimal fields for reporting + linking).
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS assets (
+                  id SERIAL PRIMARY KEY,
+                  scan_id TEXT NOT NULL,
+                  host TEXT NOT NULL,
+                  port INT NULL,
+                  scheme TEXT NULL,
+                  tech JSONB NULL,
+                  headers_summary JSONB NULL,
+                  discovered_at TIMESTAMP NOT NULL
+                );
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS tech JSONB NULL"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS headers_summary JSONB NULL"))
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS discovered_at TIMESTAMP NOT NULL DEFAULT now()"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assets_scan_id ON assets (scan_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_assets_host ON assets (host)"))
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_scan_host_port_scheme_unique
+                ON assets (scan_id, host, port, scheme)
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS endpoints (
+                  id SERIAL PRIMARY KEY,
+                  scan_id TEXT NOT NULL,
+                  asset_id INT NULL,
+                  url TEXT NOT NULL,
+                  method TEXT NOT NULL DEFAULT '',
+                  status INT NULL,
+                  title TEXT NULL,
+                  source TEXT NOT NULL,
+                  discovered_at TIMESTAMP NOT NULL
+                );
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS discovered_at TIMESTAMP NOT NULL DEFAULT now()"))
+        conn.execute(text("ALTER TABLE endpoints ALTER COLUMN method SET DEFAULT ''"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_endpoints_scan_id ON endpoints (scan_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_endpoints_asset_id ON endpoints (asset_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_endpoints_url ON endpoints (url)"))
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoints_scan_url_method_unique
+                ON endpoints (scan_id, url, method)
                 """
             )
         )
