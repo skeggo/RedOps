@@ -160,6 +160,40 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("Example vuln", md)
         self.assertIn("http/misconfig/example", md)
 
+    def test_render_scan_report_md_includes_mitre_mappings(self):
+        scan = {
+            "id": "scan-6",
+            "target": "example",
+            "status": "done",
+            "created_at": datetime(2026, 1, 6, 0, 0, 0),
+            "triggered_by": "local",
+        }
+
+        findings = [
+            {
+                "tool": "nuclei",
+                "payload": {"title": "SQL injection"},
+                "mitre": [
+                    {
+                        "technique_id": "T1190",
+                        "name": "Exploit Public-Facing Application",
+                        "tactic": "Initial Access",
+                        "tactics": [
+                            {"tactic_id": "TA0001", "shortname": "initial-access", "name": "Initial Access"}
+                        ],
+                        "confidence": 0.9,
+                        "reason": "rule match",
+                        "source": "rules",
+                    }
+                ],
+                "created_at": datetime(2026, 1, 6, 0, 0, 1),
+            }
+        ]
+
+        md = reporting.render_scan_report_md(scan=scan, tool_runs=[], findings=findings)
+        self.assertIn("MITRE ATT&CK", md)
+        self.assertIn("T1190", md)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -264,6 +264,22 @@ def compute_scan_summary(
     findings_by_tool = Counter(str(f.get("tool") or "unknown") for f in findings_list)
     findings_by_category = Counter(_classify_finding_tool(str(f.get("tool") or "")) for f in findings_list)
 
+    # Optional: MITRE ATT&CK mappings if present on findings.
+    mitre_counts: Counter[str] = Counter()
+    mitre_total = 0
+    for f in findings_list:
+        mitre = f.get("mitre")
+        if not isinstance(mitre, list):
+            continue
+        for m in mitre:
+            if not isinstance(m, dict):
+                continue
+            tid = str(m.get("technique_id") or "").strip()
+            if not tid:
+                continue
+            mitre_total += 1
+            mitre_counts[tid] += 1
+
     # A stable scan-level duration if possible.
     scan_duration_ms = _ms_between(first_started_at, last_finished_at)
 
@@ -286,6 +302,10 @@ def compute_scan_summary(
             "total": len(findings_list),
             "by_tool": dict(findings_by_tool),
             "by_category": dict(findings_by_category),
+            "mitre": {
+                "total_mappings": int(mitre_total),
+                "by_technique": dict(mitre_counts),
+            },
         },
     }
 
@@ -443,11 +463,57 @@ def render_scan_report_md(
         tool = str(f.get("tool") or "unknown")
         created_at = _iso(f.get("created_at"))
         payload = f.get("payload")
+        mitre = f.get("mitre")
 
         lines.append(f"### {tool}")
         if created_at:
             lines.append("")
             lines.append(f"- **Created at**: `{created_at}`")
+
+        if isinstance(mitre, list) and mitre:
+            lines.append(f"- **MITRE ATT&CK**: `{len(mitre)}` technique(s)")
+            for m in mitre:
+                if not isinstance(m, dict):
+                    continue
+                tid = str(m.get("technique_id") or "").strip()
+                if not tid:
+                    continue
+                name = str(m.get("name") or "").strip()
+                tactic = str(m.get("tactic") or "").strip()
+                tactics = m.get("tactics")
+                conf = m.get("confidence")
+                reason = str(m.get("reason") or "").strip()
+
+                tactic_label = ""
+                if isinstance(tactics, list) and tactics:
+                    shortnames: list[str] = []
+                    for t in tactics:
+                        if not isinstance(t, dict):
+                            continue
+                        sn = str(t.get("shortname") or "").strip()
+                        if sn:
+                            shortnames.append(sn)
+                    if shortnames:
+                        tactic_label = ", ".join(sorted(set(shortnames)))
+                elif tactic:
+                    tactic_label = tactic
+
+                label = tid
+                if name:
+                    label += f" {name}"
+                if tactic_label:
+                    label += f" ({tactic_label})"
+
+                suffix_parts: list[str] = []
+                if conf is not None:
+                    try:
+                        suffix_parts.append(f"confidence={float(conf):.2f}")
+                    except Exception:
+                        suffix_parts.append(f"confidence={conf}")
+                if reason:
+                    suffix_parts.append(reason)
+                suffix = (" — " + "; ".join(suffix_parts)) if suffix_parts else ""
+                lines.append(f"- `{label}`{suffix}")
         lines.append("")
 
         try:

@@ -7,6 +7,7 @@ import shutil
 import threading
 from datetime import datetime
 from urllib.parse import urlsplit
+from typing import Iterable
 from sqlalchemy import create_engine, text
 
 import yaml
@@ -14,6 +15,7 @@ import yaml
 from tools.plugin import load_tool
 from scope_controls import ScopeError, load_allowlist, validate_target
 from common.normalizer import normalize_and_fingerprint
+from common.mitre_rules import map_finding_to_mitre, techniques_to_seed
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, future=True)
@@ -250,6 +252,146 @@ def init_db():
                 WHERE status IN ('failed','timeout')
                 """
             )
+        )
+
+        # MITRE ATT&CK mapping tables (rules-based v1)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_techniques (
+                  technique_id TEXT PRIMARY KEY,
+                  name TEXT NULL,
+                  tactic TEXT NULL
+                );
+                """
+            )
+        )
+
+        # Extend minimal schema with catalog fields (best-effort for existing installs).
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS description TEXT NULL"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS url TEXT NULL"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS deprecated BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS modified TIMESTAMP NULL"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS finding_mitre (
+                  finding_id INT NOT NULL,
+                  technique_id TEXT NOT NULL,
+                  confidence DOUBLE PRECISION NULL,
+                  reason TEXT NULL,
+                  source TEXT NOT NULL DEFAULT 'rules',
+                  CONSTRAINT finding_mitre_finding_fk FOREIGN KEY (finding_id)
+                    REFERENCES findings(id) ON DELETE CASCADE,
+                  CONSTRAINT finding_mitre_technique_fk FOREIGN KEY (technique_id)
+                    REFERENCES mitre_techniques(technique_id) ON DELETE RESTRICT,
+                  CONSTRAINT finding_mitre_unique UNIQUE (finding_id, technique_id, source)
+                );
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finding_mitre_finding_id ON finding_mitre (finding_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finding_mitre_technique_id ON finding_mitre (technique_id)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_tactics (
+                    tactic_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    shortname TEXT NOT NULL,
+                    description TEXT NULL,
+                    url TEXT NULL,
+                    revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                    deprecated BOOLEAN NOT NULL DEFAULT FALSE,
+                    modified TIMESTAMP NULL,
+                    CONSTRAINT mitre_tactics_shortname_unique UNIQUE (shortname)
+                );
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tactics_shortname ON mitre_tactics (shortname)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_technique_tactics (
+                    technique_id TEXT NOT NULL,
+                    tactic_id TEXT NOT NULL,
+                    CONSTRAINT mitre_tt_technique_fk FOREIGN KEY (technique_id)
+                        REFERENCES mitre_techniques(technique_id) ON DELETE CASCADE,
+                    CONSTRAINT mitre_tt_tactic_fk FOREIGN KEY (tactic_id)
+                        REFERENCES mitre_tactics(tactic_id) ON DELETE CASCADE,
+                    CONSTRAINT mitre_tt_unique UNIQUE (technique_id, tactic_id)
+                );
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tt_technique_id ON mitre_technique_tactics (technique_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tt_tactic_id ON mitre_technique_tactics (tactic_id)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_sync_state (
+                    dataset TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    attack_version TEXT NULL,
+                    last_synced_at TIMESTAMP NULL,
+                    last_error TEXT NULL
+                );
+                """
+            )
+        )
+
+
+def _ensure_mitre_techniques(conn, technique_ids: Iterable[str]) -> None:
+    seeds = techniques_to_seed(technique_ids)
+    if not seeds:
+        return
+    stmt = text(
+        """
+        INSERT INTO mitre_techniques (technique_id, name, tactic)
+        VALUES (:id,:name,:tactic)
+        ON CONFLICT (technique_id)
+        DO UPDATE SET
+          name = COALESCE(NULLIF(mitre_techniques.name, ''), EXCLUDED.name),
+          tactic = COALESCE(NULLIF(mitre_techniques.tactic, ''), EXCLUDED.tactic)
+        """
+    )
+    for t in seeds:
+        conn.execute(stmt, {"id": t.technique_id, "name": t.name, "tactic": t.tactic})
+
+
+def _apply_mitre_mapping(conn, *, finding_id: int, tool: str, payload: dict) -> None:
+    mappings = map_finding_to_mitre(tool=tool, payload=payload)
+    if not mappings:
+        return
+
+    technique_ids = [str(m.get("technique_id")) for m in mappings if m.get("technique_id")]
+    _ensure_mitre_techniques(conn, technique_ids)
+
+    stmt = text(
+        """
+        INSERT INTO finding_mitre (finding_id, technique_id, confidence, reason, source)
+        VALUES (:finding_id,:technique_id,:confidence,:reason,:source)
+        ON CONFLICT (finding_id, technique_id, source)
+        DO UPDATE SET
+          confidence = GREATEST(COALESCE(finding_mitre.confidence, 0), COALESCE(EXCLUDED.confidence, 0)),
+          reason = COALESCE(EXCLUDED.reason, finding_mitre.reason)
+        """
+    )
+    for m in mappings:
+        conn.execute(
+            stmt,
+            {
+                "finding_id": int(finding_id),
+                "technique_id": str(m.get("technique_id")),
+                "confidence": float(m.get("confidence")) if m.get("confidence") is not None else None,
+                "reason": str(m.get("reason")) if m.get("reason") is not None else None,
+                "source": str(m.get("source") or "rules"),
+            },
         )
 
 
@@ -734,6 +876,7 @@ def insert_finding(scan_id: str, tool: str, payload: dict) -> bool:
                 ON CONFLICT (scan_id, fingerprint)
                 WHERE fingerprint IS NOT NULL
                 DO NOTHING
+                RETURNING id
                 """
             ),
             {
@@ -746,6 +889,13 @@ def insert_finding(scan_id: str, tool: str, payload: dict) -> bool:
                 "c": datetime.utcnow(),
             },
         )
+        finding_row = None
+        try:
+            finding_row = res.mappings().first()
+        except Exception:
+            finding_row = None
+        if finding_row and finding_row.get("id") is not None:
+            _apply_mitre_mapping(conn, finding_id=int(finding_row["id"]), tool=tool, payload=normalized_payload)
     try:
         return bool(res.rowcount)
     except Exception:
@@ -772,6 +922,7 @@ def insert_findings_bulk(scan_id: str, tool: str, payloads: list[dict]) -> int:
             ON CONFLICT (scan_id, fingerprint)
             WHERE fingerprint IS NOT NULL
             DO NOTHING
+            RETURNING id
             """
         )
 
@@ -790,6 +941,13 @@ def insert_findings_bulk(scan_id: str, tool: str, payloads: list[dict]) -> int:
                     "c": now,
                 },
             )
+            row = None
+            try:
+                row = res.mappings().first()
+            except Exception:
+                row = None
+            if row and row.get("id") is not None:
+                _apply_mitre_mapping(conn, finding_id=int(row["id"]), tool=tool, payload=normalized_payload)
             try:
                 inserted += int(res.rowcount or 0)
             except Exception:

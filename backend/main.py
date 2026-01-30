@@ -1,6 +1,8 @@
 import os
 import uuid
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import create_engine, text
@@ -15,7 +17,7 @@ engine = create_engine(DATABASE_URL, future=True)
 app = FastAPI(title="AI Red Team Operator (MVP)")
 
 
-def _get_scan_bundle(scan_id: str) -> tuple[dict, list[dict], list[dict]]:
+def _get_scan_bundle(scan_id: str) -> Tuple[Dict, List[Dict], List[Dict]]:
     with engine.begin() as conn:
         scan = conn.execute(text("SELECT * FROM scans WHERE id=:id"), {"id": scan_id}).mappings().first()
         if not scan:
@@ -31,6 +33,7 @@ def _get_scan_bundle(scan_id: str) -> tuple[dict, list[dict], list[dict]]:
                   f.created_at,
                   f.asset_id,
                   f.endpoint_id,
+                                    COALESCE(m.mitre, '[]'::jsonb) AS mitre,
                   e.url AS endpoint_url,
                   e.method AS endpoint_method,
                   e.status AS endpoint_status,
@@ -40,6 +43,40 @@ def _get_scan_bundle(scan_id: str) -> tuple[dict, list[dict], list[dict]]:
                   a.port AS asset_port,
                   a.scheme AS asset_scheme
                 FROM findings f
+                                LEFT JOIN LATERAL (
+                                    SELECT jsonb_agg(
+                                        jsonb_build_object(
+                                            'technique_id', fm.technique_id,
+                                            'name', mt.name,
+                                            -- Backwards-compatible single-string tactic field (historical)
+                                            'tactic', mt.tactic,
+                                            -- Canonical list of tactics for this technique
+                                            'tactics', COALESCE(tt.tactics, '[]'::jsonb),
+                                            'confidence', fm.confidence,
+                                            'reason', fm.reason,
+                                            'source', fm.source
+                                        )
+                                        ORDER BY fm.confidence DESC NULLS LAST, fm.technique_id ASC
+                                    ) AS mitre
+                                    FROM finding_mitre fm
+                                    JOIN mitre_techniques mt ON mt.technique_id = fm.technique_id
+                                    LEFT JOIN (
+                                        SELECT
+                                            mtt.technique_id,
+                                            jsonb_agg(
+                                                jsonb_build_object(
+                                                    'tactic_id', t.tactic_id,
+                                                    'shortname', t.shortname,
+                                                    'name', t.name
+                                                )
+                                                ORDER BY t.tactic_id ASC
+                                            ) AS tactics
+                                        FROM mitre_technique_tactics mtt
+                                        JOIN mitre_tactics t ON t.tactic_id = mtt.tactic_id
+                                        GROUP BY mtt.technique_id
+                                    ) tt ON tt.technique_id = fm.technique_id
+                                    WHERE fm.finding_id = f.id
+                                ) m ON TRUE
                 LEFT JOIN endpoints e ON e.id = f.endpoint_id
                 LEFT JOIN assets a ON a.id = f.asset_id
                 WHERE f.scan_id = :id
@@ -244,6 +281,97 @@ def init_db():
             WHERE status IN ('failed','timeout')
         """))
 
+        # MITRE ATT&CK mapping tables (rules-based v1)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_techniques (
+                  technique_id TEXT PRIMARY KEY,
+                  name TEXT NULL,
+                  tactic TEXT NULL
+                );
+                """
+            )
+        )
+
+        # Extend minimal schema with catalog fields (best-effort for existing installs).
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS description TEXT NULL"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS url TEXT NULL"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS deprecated BOOLEAN NOT NULL DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS modified TIMESTAMP NULL"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS finding_mitre (
+                  finding_id INT NOT NULL,
+                  technique_id TEXT NOT NULL,
+                  confidence DOUBLE PRECISION NULL,
+                  reason TEXT NULL,
+                  source TEXT NOT NULL DEFAULT 'rules',
+                  CONSTRAINT finding_mitre_finding_fk FOREIGN KEY (finding_id)
+                    REFERENCES findings(id) ON DELETE CASCADE,
+                  CONSTRAINT finding_mitre_technique_fk FOREIGN KEY (technique_id)
+                    REFERENCES mitre_techniques(technique_id) ON DELETE RESTRICT,
+                  CONSTRAINT finding_mitre_unique UNIQUE (finding_id, technique_id, source)
+                );
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finding_mitre_finding_id ON finding_mitre (finding_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finding_mitre_technique_id ON finding_mitre (technique_id)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_tactics (
+                  tactic_id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  shortname TEXT NOT NULL,
+                  description TEXT NULL,
+                  url TEXT NULL,
+                  revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                  deprecated BOOLEAN NOT NULL DEFAULT FALSE,
+                  modified TIMESTAMP NULL,
+                  CONSTRAINT mitre_tactics_shortname_unique UNIQUE (shortname)
+                );
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tactics_shortname ON mitre_tactics (shortname)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_technique_tactics (
+                  technique_id TEXT NOT NULL,
+                  tactic_id TEXT NOT NULL,
+                  CONSTRAINT mitre_tt_technique_fk FOREIGN KEY (technique_id)
+                    REFERENCES mitre_techniques(technique_id) ON DELETE CASCADE,
+                  CONSTRAINT mitre_tt_tactic_fk FOREIGN KEY (tactic_id)
+                    REFERENCES mitre_tactics(tactic_id) ON DELETE CASCADE,
+                  CONSTRAINT mitre_tt_unique UNIQUE (technique_id, tactic_id)
+                );
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tt_technique_id ON mitre_technique_tactics (technique_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tt_tactic_id ON mitre_technique_tactics (tactic_id)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS mitre_sync_state (
+                  dataset TEXT PRIMARY KEY,
+                  source TEXT NOT NULL,
+                  attack_version TEXT NULL,
+                  last_synced_at TIMESTAMP NULL,
+                  last_error TEXT NULL
+                );
+                """
+            )
+        )
+
 @app.post("/scan")
 def create_scan(body: dict, request: Request):
     api_key_id, _secret = authenticate_request(request)
@@ -320,7 +448,7 @@ def get_scan(scan_id: str):
 
 
 @app.get("/scans")
-def list_scans(limit: int = 50, offset: int = 0, status: str | None = None):
+def list_scans(limit: int = 50, offset: int = 0, status: Optional[str] = None):
     """List scans (newest first) so you can retrieve old scan IDs for reports."""
 
     if limit < 1 or limit > 200:
