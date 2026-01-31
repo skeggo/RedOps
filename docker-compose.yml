@@ -53,5 +53,21 @@ services:
     image: bkimminich/juice-shop
     ports:
       - "3000:3000"
+  frontend:
+    image: node:22
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    environment:
+      # Server-side route handlers should use the internal service URL.
+      BACKEND_URL: ${BACKEND_URL:-http://backend:8000}
+      # Optional (UI display / local non-docker dev).
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      API_KEY: ${FRONTEND_API_KEY:-changeme}
+    command: ["sh", "-lc", "npm install && npm run dev -- --port 3001 --hostname 0.0.0.0"]
+    ports:
+      - "3001:3001"
+    depends_on:
+      - backend
 volumes:
   pgdata:

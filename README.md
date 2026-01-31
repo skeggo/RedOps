@@ -83,3 +83,33 @@ You can also browse the API in the FastAPI docs:
 - Swagger UI: `http://localhost:8000/docs`
 - OpenAPI JSON: `http://localhost:8000/openapi.json`
 
+## Frontend (Next.js MVP)
+
+The project includes a minimal web UI under `frontend/`.
+
+### Configure
+
+Set these environment variables (recommended via `frontend/.env.local`):
+
+- `NEXT_PUBLIC_API_BASE_URL` (example: `http://localhost:8000`)
+- `API_KEY` (example: `changeme`)
+
+When running via Docker Compose, the frontend container uses:
+
+- `BACKEND_URL` (default: `http://backend:8000`)
+
+Notes:
+
+- The UI proxies requests through Next.js route handlers (e.g. `/api/scans/...`) so the API key is not required in the browser.
+- Backend must be configured with a matching `API_KEYS` entry.
+
+### Run locally
+
+```bash
+cd frontend
+npm install
+API_KEY=changeme NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 npm run dev
+```
+
+Then open `http://localhost:3000`.
+
