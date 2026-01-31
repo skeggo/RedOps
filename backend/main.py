@@ -490,3 +490,24 @@ def get_scan_report_md(scan_id: str):
     scan, tool_runs, findings = _get_scan_bundle(scan_id)
     md = render_scan_report_md(scan=scan, tool_runs=tool_runs, findings=findings)
     return PlainTextResponse(content=md, media_type="text/markdown; charset=utf-8")
+
+
+@app.delete("/scans/{scan_id}")
+def delete_scan(scan_id: str, request: Request):
+    # Require API auth for destructive actions.
+    authenticate_request(request)
+
+    with engine.begin() as conn:
+        exists = conn.execute(text("SELECT 1 FROM scans WHERE id=:id"), {"id": scan_id}).first()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        # Delete in best-effort dependency order.
+        # findings -> finding_mitre cascades via FK on finding_id.
+        conn.execute(text("DELETE FROM tool_runs WHERE scan_id=:id"), {"id": scan_id})
+        conn.execute(text("DELETE FROM findings WHERE scan_id=:id"), {"id": scan_id})
+        conn.execute(text("DELETE FROM endpoints WHERE scan_id=:id"), {"id": scan_id})
+        conn.execute(text("DELETE FROM assets WHERE scan_id=:id"), {"id": scan_id})
+        conn.execute(text("DELETE FROM scans WHERE id=:id"), {"id": scan_id})
+
+    return {"deleted": True, "scan_id": scan_id}

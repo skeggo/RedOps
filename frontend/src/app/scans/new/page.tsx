@@ -21,12 +21,20 @@ type ApiError = {
 
 export default function NewScanPage() {
   const router = useRouter();
-  const [target, setTarget] = useState("");
+  const [target, setTarget] = useState("http://testphp.vulnweb.com");
   const [loading, setLoading] = useState(false);
   const [created, setCreated] = useState<CreateScanOk | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const canSubmit = useMemo(() => target.trim().length > 0 && !loading, [target, loading]);
+
+  function normalizeTarget(input: string): string {
+    const t = input.trim();
+    if (!t) return t;
+    // If user enters a bare host (e.g., testphp.vulnweb.com), assume http://
+    if (!/^https?:\/\//i.test(t)) return `http://${t}`;
+    return t;
+  }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -34,10 +42,14 @@ export default function NewScanPage() {
     setCreated(null);
     setLoading(true);
     try {
+      const normalizedTarget = normalizeTarget(target);
       const res = await fetch("/api/scans/create", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ target: target.trim() }),
+        body: JSON.stringify({
+          target: normalizedTarget,
+          concurrency_cap: 10,
+        }),
       });
 
       const text = await res.text();
@@ -78,7 +90,7 @@ export default function NewScanPage() {
           </label>
           <input
             className="input"
-            placeholder="testphp.vulnweb.com"
+            placeholder="http://testphp.vulnweb.com"
             value={target}
             onChange={(e) => setTarget(e.target.value)}
             autoComplete="off"

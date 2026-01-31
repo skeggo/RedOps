@@ -266,13 +266,6 @@ def init_db():
                 """
             )
         )
-
-        # Extend minimal schema with catalog fields (best-effort for existing installs).
-        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS description TEXT NULL"))
-        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS url TEXT NULL"))
-        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE"))
-        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS deprecated BOOLEAN NOT NULL DEFAULT FALSE"))
-        conn.execute(text("ALTER TABLE mitre_techniques ADD COLUMN IF NOT EXISTS modified TIMESTAMP NULL"))
         conn.execute(
             text(
                 """
@@ -293,57 +286,6 @@ def init_db():
         )
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finding_mitre_finding_id ON finding_mitre (finding_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_finding_mitre_technique_id ON finding_mitre (technique_id)"))
-
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS mitre_tactics (
-                    tactic_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    shortname TEXT NOT NULL,
-                    description TEXT NULL,
-                    url TEXT NULL,
-                    revoked BOOLEAN NOT NULL DEFAULT FALSE,
-                    deprecated BOOLEAN NOT NULL DEFAULT FALSE,
-                    modified TIMESTAMP NULL,
-                    CONSTRAINT mitre_tactics_shortname_unique UNIQUE (shortname)
-                );
-                """
-            )
-        )
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tactics_shortname ON mitre_tactics (shortname)"))
-
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS mitre_technique_tactics (
-                    technique_id TEXT NOT NULL,
-                    tactic_id TEXT NOT NULL,
-                    CONSTRAINT mitre_tt_technique_fk FOREIGN KEY (technique_id)
-                        REFERENCES mitre_techniques(technique_id) ON DELETE CASCADE,
-                    CONSTRAINT mitre_tt_tactic_fk FOREIGN KEY (tactic_id)
-                        REFERENCES mitre_tactics(tactic_id) ON DELETE CASCADE,
-                    CONSTRAINT mitre_tt_unique UNIQUE (technique_id, tactic_id)
-                );
-                """
-            )
-        )
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tt_technique_id ON mitre_technique_tactics (technique_id)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mitre_tt_tactic_id ON mitre_technique_tactics (tactic_id)"))
-
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS mitre_sync_state (
-                    dataset TEXT PRIMARY KEY,
-                    source TEXT NOT NULL,
-                    attack_version TEXT NULL,
-                    last_synced_at TIMESTAMP NULL,
-                    last_error TEXT NULL
-                );
-                """
-            )
-        )
 
 
 def _ensure_mitre_techniques(conn, technique_ids: Iterable[str]) -> None:
@@ -462,6 +404,11 @@ class ToolRunRecorder:
         self.timed_out: bool = False
         self.stdout_path = stdout_path
         self.stderr_path = stderr_path
+        # Optional context for live DB progress updates.
+        self.run_id: str | None = None
+        self.tool: str | None = None
+        self._last_progress_percent: float | None = None
+        self._last_progress_update_ts: float = 0.0
 
     def append(self, stdout: str | None, stderr: str | None):
         if self.stdout_path and stdout:
@@ -578,6 +525,61 @@ def update_tool_run(
         )
 
 
+def update_tool_run_metadata(*, run_id: str, patch: dict):
+    """Merge a JSON patch into tool_runs.metadata for a single run.
+
+    Used for live progress updates (e.g., nuclei -stats percent).
+    """
+
+    if not patch:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE tool_runs
+                SET metadata = metadata || CAST(:patch AS JSONB)
+                WHERE id = :id
+                """
+            ),
+            {"id": run_id, "patch": json.dumps(_scrub(patch) or {})},
+        )
+
+
+def _parse_nuclei_stats_line(line: str) -> dict | None:
+    s = (line or "").strip()
+    if not s or not s.startswith("{"):
+        return None
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if "percent" not in obj:
+        return None
+
+    # Normalize percent to a float if possible.
+    p = obj.get("percent")
+    percent: float | None
+    try:
+        if isinstance(p, str):
+            p = p.strip().rstrip("%")
+        percent = float(p)
+    except Exception:
+        percent = None
+
+    out: dict = {"raw": obj}
+    if percent is not None:
+        out["percent"] = max(0.0, min(100.0, percent))
+
+    # Copy a few commonly useful fields when present.
+    for key in ("duration", "errors", "hosts", "matched", "requests", "templates", "total"):
+        if key in obj:
+            out[key] = obj.get(key)
+    return out
+
+
 def run(cmd: list[str], timeout: int = 600, recorder: ToolRunRecorder | None = None) -> str:
     log("CMD: " + " ".join(cmd))
 
@@ -601,6 +603,31 @@ def run(cmd: list[str], timeout: int = 600, recorder: ToolRunRecorder | None = N
                 if not is_stdout:
                     with stderr_lock:
                         stderr_tail = (stderr_tail + line)[-2000:]
+
+                    # Live progress for nuclei (-stats emits JSON lines on stderr).
+                    if recorder and recorder.tool == "nuclei" and recorder.run_id:
+                        stats = _parse_nuclei_stats_line(line)
+                        if stats and "percent" in stats:
+                            now = time.monotonic()
+                            percent = float(stats.get("percent"))
+                            should_write = False
+                            if recorder._last_progress_percent is None:
+                                should_write = True
+                            elif abs(percent - float(recorder._last_progress_percent)) >= 1.0:
+                                should_write = True
+                            elif (now - float(recorder._last_progress_update_ts or 0.0)) >= 2.0:
+                                should_write = True
+
+                            if should_write:
+                                recorder._last_progress_percent = percent
+                                recorder._last_progress_update_ts = now
+                                update_tool_run_metadata(
+                                    run_id=recorder.run_id,
+                                    patch={
+                                        "progress": {"tool": "nuclei", "percent": percent},
+                                        "nuclei_stats": stats,
+                                    },
+                                )
         finally:
             try:
                 stream.close()
@@ -1115,6 +1142,8 @@ def run_pipeline(scan_id: str, target: str, mode: str):
             )
 
         recorder = ToolRunRecorder(stdout_path=stdout_path, stderr_path=stderr_path)
+        recorder.run_id = run_id
+        recorder.tool = name
         ctx["_tool_run_recorder"] = recorder
 
         # Per-tool invocation context.

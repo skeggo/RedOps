@@ -1,5 +1,8 @@
 import Link from "next/link";
 import { getSelfBaseUrl } from "@/lib/server-url";
+import { DeleteScanButton } from "./DeleteScanButton";
+import { FindingsPreviewClient } from "./FindingsPreviewClient";
+import { ScanProgressClient } from "./ScanProgressClient";
 
 type ToolRun = {
   id: string;
@@ -12,6 +15,10 @@ type ToolRun = {
   duration_ms?: number | null;
   exit_code?: number | null;
   short_error?: string | null;
+  stdout_path?: string | null;
+  stderr_path?: string | null;
+  artifact_path?: string | null;
+  metadata?: unknown;
 };
 
 type Finding = {
@@ -65,17 +72,6 @@ function statusClass(status: string): string {
   if (s === "failed" || s === "timeout") return "pill danger";
   if (s === "queued" || s === "running") return "pill accent";
   return "pill";
-}
-
-function jsonPreview(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  try {
-    const s = JSON.stringify(v);
-    if (s.length <= 240) return s;
-    return s.slice(0, 240) + "…";
-  } catch {
-    return String(v);
-  }
 }
 
 export default async function ScanDetailPage({
@@ -209,14 +205,16 @@ export default async function ScanDetailPage({
           <Link className="btn" href="/scans">
             Back
           </Link>
+          <ScanProgressClient scanId={scanId} initialStatus={scan?.status || "unknown"} initialToolRuns={toolRuns} />
+          <DeleteScanButton scanId={scanId} />
           <a className="btn primary" href={`/api/scans/${encodeURIComponent(scanId)}/report`}>
             Download report.md
           </a>
         </div>
       </div>
 
-      <div className="row">
-        <div className="card">
+      <div className="stack">
+        <div className="card" style={{ overflowX: "auto" }}>
           <div style={{ fontWeight: 650, marginBottom: 8 }}>Tool runs</div>
           <table className="table">
             <thead>
@@ -289,49 +287,21 @@ export default async function ScanDetailPage({
         </div>
       </div>
 
-      <div className="row" style={{ marginTop: 12 }}>
-        <div className="card">
-          <div style={{ fontWeight: 650, marginBottom: 8 }}>Findings ({findings.length})</div>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Tool</th>
-                <th>When</th>
-                <th>Endpoint</th>
-                <th>Fingerprint</th>
-                <th>Payload (preview)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {findings.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="muted">
-                    No findings yet.
-                  </td>
-                </tr>
-              ) : (
-                findings.map((f, i) => (
-                  <tr key={`${f.tool}-${f.fingerprint ?? i}`}
-                    >
-                    <td>{f.tool}</td>
-                    <td>{formatDate(f.created_at)}</td>
-                    <td className="muted" style={{ maxWidth: 420 }}>
-                      {(f.endpoint_method || "").toUpperCase()} {f.endpoint_url || ""}
-                    </td>
-                    <td className="muted" style={{ maxWidth: 280 }}>
-                      {f.fingerprint || "—"}
-                    </td>
-                    <td className="muted" style={{ maxWidth: 520 }}>
-                      {jsonPreview(f.payload)}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+      <div className="stack" style={{ marginTop: 12 }}>
+        <FindingsPreviewClient
+          scanId={scanId}
+          totalCount={findings.length}
+          findings={findings.map((f) => ({
+            tool: f.tool,
+            fingerprint: f.fingerprint,
+            created_at: f.created_at,
+            payload: f.payload,
+            endpoint_method: f.endpoint_method,
+            endpoint_url: f.endpoint_url,
+          }))}
+        />
 
-        <div className="card">
+        <div className="card" style={{ overflowX: "auto" }}>
           <div style={{ fontWeight: 650, marginBottom: 8 }}>MITRE techniques ({techniqueRows.length})</div>
           <table className="table">
             <thead>
